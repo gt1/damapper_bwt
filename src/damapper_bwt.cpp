@@ -2178,20 +2178,22 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << "usage: " << arg.progname << " [<parameters>] ref.fasta <reads.fasta" << std::endl;
 	ostr << "\n";
 	ostr << "parameters:\n";
-	ostr << " -k : seed length (default 20)\n";
-	ostr << " -K : kmer cache word length (default 12)\n";
+	ostr << " -k: seed length (default 20)\n";
+	ostr << " -K: kmer cache word length (default 12)\n";
 	#if defined(_OPENMP)
-	ostr << " -p : number of threads (defaults to number of cores on machine)\n";
+	ostr << " -p: number of threads (defaults to number of cores on machine)\n";
 	#else
-	ostr << " -p : no effect (compiled without support for OpenMP parallelism)\n";
+	ostr << " -p: no effect (compiled without support for OpenMP parallelism)\n";
 	#endif
-	ostr << " -v : verbosity level (default: 1)\n";
-	ostr << " -i : maximum number of read bases per input block (default 64m)\n";
-	ostr << " --sasamplingrate : SA sampling rate (default 32)\n";
+	ostr << " -v: verbosity level (default: 1)\n";
+	ostr << " -i: maximum number of read bases per input block (default 64m)\n";
+	ostr << " -M: damapper memory limit\n";
+	ostr << " --sasamplingrate: SA sampling rate (default 32)\n";
+	// ostr << " --isasamplingrate : ISA sampling rate (default 32)\n";
+	ostr << " --bwtconstrmem: memory used to construct BWT (default 3/4 of machine's memory)\n";
 
 	return ostr.str();
 }
-
 
 int main(int argc, char * argv[])
 {
