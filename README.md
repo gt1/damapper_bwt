@@ -17,8 +17,8 @@ git clone --recursive https://github.com/gt1/damapper_bwt
 Compilation of damapper_bwt
 ---------------------------
 
-damapper_bwt needs libmaus2 [https://github.com/gt1/libmaus2] and the DALIGNER library [https://github.com/gt1/DALIGNER/tree/all_fixes_19_09_2015_prs]. 
-When libmaus2 is installed in ${LIBMAUSPREFIX} and the DALIGNER library in ${DALIGNERLIBPREFIX} then damapper_bwt can be compiled and
+damapper_bwt needs libmaus2 [https://github.com/gt1/libmaus2].
+When libmaus2 is installed in ${LIBMAUSPREFIX} then damapper_bwt can be compiled and
 installed in ${HOME}/damapper_bwt using
 
         - autoreconf -i -f

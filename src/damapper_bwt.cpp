@@ -69,13 +69,14 @@
 #include <libmaus2/util/MemoryStatistics.hpp>
 
 // damapper interface
-#include <DB.h>
-#include <align.h>
 
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
+#include "QV.h"
+#include "DB.h"
+#include "align.h"
 #include "map.h"
 
 #if defined(__cplusplus)
