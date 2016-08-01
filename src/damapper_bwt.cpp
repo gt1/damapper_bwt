@@ -59,6 +59,7 @@
 #include <libmaus2/geometry/RangeSet.hpp>
 #include <libmaus2/dazzler/align/SimpleOverlapVectorParser.hpp>
 #include <libmaus2/math/numbits.hpp>
+#include <libmaus2/dazzler/align/RefMapEntryVector.hpp>
 
 #include <libmaus2/lcs/EnvelopeFragment.hpp>
 #include <libmaus2/lcs/FragmentEnvelope.hpp>
@@ -1193,17 +1194,21 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			int64_t const rtspace,
 			bool const rcalmdnm,
 			libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_t rseqstrat,
-			std::string const & rrgid
-		) : converter(rtspace,rcalmdnm,rseqstrat,rrgid), fragment(), ARC()
+			std::string const & rrgid,
+			libmaus2::dazzler::align::RefMapEntryVector const & refmap
+		) : converter(rtspace,rcalmdnm,rseqstrat,rrgid,refmap), fragment(), ARC()
 		{
 
 		}
 	};
 
 	libmaus2::autoarray::AutoArray<LASToBamContext::unique_ptr_type> Acontexts(numthreads);
+	libmaus2::dazzler::align::RefMapEntryVector refmap;
+	for ( uint64_t i = 0; i < Pbamheader->getNumRef(); ++i )
+		refmap.push_back(libmaus2::dazzler::align::RefMapEntry(i,0));
 	for ( uint64_t i = 0; i < numthreads; ++i )
 	{
-		LASToBamContext::unique_ptr_type Tptr(new LASToBamContext(tspace,true /* mdnm */,libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_none,std::string()));
+		LASToBamContext::unique_ptr_type Tptr(new LASToBamContext(tspace,true /* mdnm */,libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_none,std::string(),refmap));
 		Acontexts[i] = UNIQUE_PTR_MOVE(Tptr);
 	}
 
