@@ -58,6 +58,7 @@
 #include <libmaus2/sorting/InterleavedRadixSort.hpp>
 #include <libmaus2/geometry/RangeSet.hpp>
 #include <libmaus2/dazzler/align/SimpleOverlapVectorParser.hpp>
+#include <libmaus2/math/numbits.hpp>
 
 #include <libmaus2/lcs/EnvelopeFragment.hpp>
 #include <libmaus2/lcs/FragmentEnvelope.hpp>
@@ -1006,7 +1007,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 
 	#if defined(_OPENMP)
 	uint64_t const defnumproc = libmaus2::parallel::NumCpus::getNumLogicalProcessors();
-	uint64_t const numthreads = arg.argPresent("p") ? std::max(static_cast<uint64_t>(1),arg.getUnsignedNumericArg<uint64_t>("p")) : defnumproc;
+	uint64_t const numthreads = libmaus2::math::nextTwoPow(arg.argPresent("p") ? std::max(static_cast<uint64_t>(1),arg.getUnsignedNumericArg<uint64_t>("p")) : defnumproc);
 	#else
 	uint64_t const numthreads = 1;
 	#endif
