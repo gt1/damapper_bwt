@@ -2174,7 +2174,7 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 {
 	std::ostringstream ostr;
 
-	ostr << "usage: " << arg.progname << " [<parameters>] ref.bwt <reads.fasta" << std::endl;
+	ostr << "usage: " << arg.progname << " [<parameters>] ref.fasta <reads.fasta" << std::endl;
 	ostr << "\n";
 	ostr << "parameters:\n";
 	ostr << " -k : seed length (default 20)\n";
