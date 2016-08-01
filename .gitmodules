@@ -1,0 +1,4 @@
+[submodule "damapper"]
+	path = damapper
+	url = git@github.com:gt1/DAMAPPER.git
+	branch = dynamic_threads
