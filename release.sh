@@ -9,6 +9,17 @@ VERSION=`grep <configure.ac "AC_INIT" | perl -p -e "s/.*AC_INIT\(//" | awk -F ',
 DATE=`date +"%Y%m%d%H%M%S"`
 RELEASE=${VERSION}-release-${DATE}
 git checkout -b ${RELEASE}-branch master
+
+pushd src
+	for i in `find . -type l` ; do
+		F=`readlink ${i}`
+		rm ${i}
+		cp ${F} ${i}
+		git add ${i}
+	done
+	git commit -m "Release ${RELEASE} / Replace links by files"
+popd
+
 autoreconf -i -f
 ADDFILES="INSTALL Makefile.in aclocal.m4 autom4te.cache compile config.guess config.h.in config.sub configure depcomp install-sh ltmain.sh m4/libtool.m4 m4/ltoptions.m4 m4/ltsugar.m4 m4/ltversion.m4 m4/lt~obsolete.m4 missing src/Makefile.in"
 mv .gitignore .gitignore_
