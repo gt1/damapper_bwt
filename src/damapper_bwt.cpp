@@ -2024,96 +2024,125 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 
 					assert ( nextexpt == refbread );
 
-					bool secondary = false;
-					bool supplementary = false;
-					uint64_t chainid = 0;
-
+					uint64_t numchains = 0;
 					for ( uint64_t z = ilow; z < ihigh; ++z )
 					{
 						std::pair<uint8_t const *, uint8_t const *> const P = OVLdata.getData(z);
-
-						int64_t const aread = libmaus2::dazzler::align::OverlapData::getARead(P.first);
-						int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead(P.first);
-						int64_t const flags = libmaus2::dazzler::align::OverlapData::getFlags(P.first);
-						bool const inverse = libmaus2::dazzler::align::OverlapData::getInverseFlag(P.first);
-
 						bool const isStart = libmaus2::dazzler::align::OverlapData::getStartFlag(P.first);
-
 						if ( isStart )
+							numchains++;
+					}
+
+					uint64_t il = ilow;
+					uint64_t chainid = 0;
+					while ( il < ihigh )
+					{
+						uint64_t ih = il+1;
+						while (
+							ih < ihigh
+							&&
+							(!libmaus2::dazzler::align::OverlapData::getStartFlag(OVLdata.getData(ih).first))
+						)
+							++ih;
+
+						uint64_t const lchainid = chainid++;
+						bool const secondary = (lchainid > 0);
+
+						for ( uint64_t z = il; z < ih; ++z )
 						{
-							// bool const isBest = libmaus2::dazzler::align::OverlapData::getBestFlag(P.first);
+							std::pair<uint8_t const *, uint8_t const *> const P = OVLdata.getData(z);
 
-							secondary = (chainid > 0);
-							supplementary = false;
-							
-							chainid++;
-						}
-						else
-						{
-							supplementary = true;
-						}
+							int64_t const aread = libmaus2::dazzler::align::OverlapData::getARead(P.first);
+							int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead(P.first);
+							int64_t const flags = libmaus2::dazzler::align::OverlapData::getFlags(P.first);
+							bool const inverse = libmaus2::dazzler::align::OverlapData::getInverseFlag(P.first);
 
-						// bool const primary = libmaus2::dazzler::align::OverlapData::getPrimaryFlag(P.first);
-						uint64_t const readlen = readsdb.reads[bread].rlen;
+							bool const supplementary = (z != il);
 
-						if ( z==ilow )
-						{
-							// compute reverse complement
-							context.ARC.ensureSize(readlen + 2);
+							// bool const primary = libmaus2::dazzler::align::OverlapData::getPrimaryFlag(P.first);
+							uint64_t const readlen = readsdb.reads[bread].rlen;
 
-							char * const ra = context.ARC.begin();
-							char * rp = ra + readlen + 2;
-							char const * src = reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[bread].boff - 1;
-
-							*(--rp)	= (*(src++));
-							while ( rp != ra+1 )
-								*(--rp)	= (*(src++)) ^ 3;
-							*(--rp)	= (*(src++));
-						}
-
-						try
-						{
-							if ( ! inverse )
+							if ( z==ilow )
 							{
-								context.converter.convert(
-									P.first,
-									reinterpret_cast<char const *>(refdb.bases) + refdb.reads[aread].boff,
-									refdb.reads[aread].rlen,
-									reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[bread].boff,
-									readsdb.reads[bread].rlen,
-									Areadnames.begin() + O[bread].nameoff,
-									context.fragment,
-									secondary,
-									supplementary,
-									*Pbamheader
-								);
+								// compute reverse complement
+								context.ARC.ensureSize(readlen + 2);
+
+								char * const ra = context.ARC.begin();
+								char * rp = ra + readlen + 2;
+								char const * src = reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[bread].boff - 1;
+
+								*(--rp)	= (*(src++));
+								while ( rp != ra+1 )
+									*(--rp)	= (*(src++)) ^ 3;
+								*(--rp)	= (*(src++));
 							}
-							else
+
+							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_i("ci",lchainid);
+							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_n("cn",numchains);
+							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_j("cj",z-il);
+							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_l("cl",ih-il);
+
+							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * reqs[] =
 							{
-								context.converter.convert(
-									P.first,
-									reinterpret_cast<char const *>(refdb.bases) + refdb.reads[aread].boff,
-									refdb.reads[aread].rlen,
-									context.ARC.begin()+1 /* skip terminator */,
-									readlen,
-									Areadnames.begin() + O[bread].nameoff,
-									context.fragment,
-									secondary,
-									supplementary,
-									*Pbamheader
-								);
+								&req_i,
+								&req_n,
+								&req_j,
+								&req_l
+							};
+
+							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &reqs[0];
+							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &reqs[sizeof(reqs)/sizeof(reqs[0])];
+
+							try
+							{
+								if ( ! inverse )
+								{
+									context.converter.convert(
+										P.first,
+										reinterpret_cast<char const *>(refdb.bases) + refdb.reads[aread].boff,
+										refdb.reads[aread].rlen,
+										reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[bread].boff,
+										readsdb.reads[bread].rlen,
+										Areadnames.begin() + O[bread].nameoff,
+										context.fragment,
+										secondary,
+										supplementary,
+										*Pbamheader,
+										aux_a,
+										aux_e
+									);
+								}
+								else
+								{
+									context.converter.convert(
+										P.first,
+										reinterpret_cast<char const *>(refdb.bases) + refdb.reads[aread].boff,
+										refdb.reads[aread].rlen,
+										context.ARC.begin()+1 /* skip terminator */,
+										readlen,
+										Areadnames.begin() + O[bread].nameoff,
+										context.fragment,
+										secondary,
+										supplementary,
+										*Pbamheader,
+										aux_a,
+										aux_e
+									);
+								}
 							}
-						}
-						catch(std::exception const & ex)
-						{
-							std::cerr << ex.what() << std::endl;
-							std::cerr
-								<< aread << " "
-								<< bread << " "
-								<< flags
-								<< std::endl;
+							catch(std::exception const & ex)
+							{
+								std::cerr << ex.what() << std::endl;
+								std::cerr
+									<< aread << " "
+									<< bread << " "
+									<< flags
+									<< std::endl;
+							}
 						}
 
+
+						il = ih;
 					}
 
 					nextexpt += 1;
