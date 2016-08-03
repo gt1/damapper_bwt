@@ -67,3 +67,5 @@ the position of an alignment inside its chain:
 * ci (integer) stores the chain id an alignment belongs to (this ranges from 0 to the value stored in cn minus one)
 * cl (integer) stores the length of the chain this alignment belongs to (i.e. the chain is comprised of this many alignments)
 * cj (integer) stores the chain link id of the alignment (this ranges from 0 to the value stored in cl minus one)
+
+Note that only the alignment line for a read (the one with ci=0 and cj=0 if the read is aligned) store the query sequence.  All other lines for a read have an undefined query sequence field.
