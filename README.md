@@ -22,8 +22,7 @@ When libmaus2 is installed in ${LIBMAUSPREFIX} then damapper_bwt can be compiled
 installed in ${HOME}/damapper_bwt using
 
         - autoreconf -i -f
-        - ./configure --with-libmaus2=${LIBMAUSPREFIX} --with-daligner=${DALIGNERLIBPREFIX} \
-                --prefix=${HOME}/damapper_bwt
+        - ./configure --with-libmaus2=${LIBMAUSPREFIX} --prefix=${HOME}/damapper_bwt
         - make install
 
 Running damapper_bwt
