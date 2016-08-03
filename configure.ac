@@ -1,4 +1,4 @@
-AC_INIT(damapper_bwt,0.0.2,[tischler@mpi-cbg.de],[damapper_bwt],[http://www.mpi-cbg.de])
+AC_INIT(damapper_bwt,0.0.3,[tischler@mpi-cbg.de],[damapper_bwt],[http://www.mpi-cbg.de])
 AC_CANONICAL_SYSTEM
 AC_PROG_LIBTOOL
 
