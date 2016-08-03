@@ -53,7 +53,7 @@ The following parameters can be used (no space allowed between option an argumen
 BAM output files
 ----------------
 
-damapper_bwt outputs alignments as an uncompressed BAM file. As damapper deliberately (see [https://dazzlerblog.wordpress.com/2016/07/31/damapper-mapping-your-reads/])
+damapper_bwt outputs alignments as an uncompressed BAM file. As damapper deliberately (see https://dazzlerblog.wordpress.com/2016/07/31/damapper-mapping-your-reads/)
 outputs more than one alignment per read for several reasons like
 
 1. there is more than one possible locus to place a read on the reference
