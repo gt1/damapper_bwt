@@ -1212,6 +1212,15 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		Acontexts[i] = UNIQUE_PTR_MOVE(Tptr);
 	}
 
+	uint64_t const histthres = 64*1024;
+	uint64_t const histmult = histthres + 1;
+	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> Ahist(numthreads);
+	for ( uint64_t i = 0; i < numthreads; ++i )
+	{
+		libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type thist(new libmaus2::autoarray::AutoArray<uint64_t>(histmult));
+		Ahist[i] = UNIQUE_PTR_MOVE(thist);
+	}
+
 	libmaus2::timing::RealTimeClock accclock;
 	accclock.start();
 
@@ -1501,30 +1510,89 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			for ( uint64_t i = 0; i < ubounds.size(); ++i )
 				assert ( i == 0 || (i+1)==ubounds.size() || GRKM[ubounds[i]-1].code != GRKM[ubounds[i]].code );
 
+			#if defined(_OPENMP)
+			#pragma omp parallel for num_threads(numthreads)
+			#endif
+			for ( uint64_t t = 0; t < numthreads; ++t )
+			{
+				std::fill(
+					Ahist[t]->begin(),
+					Ahist[t]->end(),
+					0ull
+				);
+			}
+
+			// unified package sizes
 			std::vector<uint64_t> usize(ubounds.size());
 			#if defined(_OPENMP)
 			#pragma omp parallel for num_threads(numthreads)
 			#endif
 			for ( uint64_t t = 1; t < ubounds.size(); ++t )
 			{
+				libmaus2::autoarray::AutoArray<uint64_t> & thist = *(Ahist[t-1].get());
+
+				// lower bound
 				uint64_t ulow = ubounds[t-1];
+				// upper bound
 				uint64_t const utop = ubounds[t];
 
+				// output pointer
 				uint64_t uout = ulow;
 				while ( ulow < utop )
 				{
+					// go to end of code
 					uint64_t uhigh = ulow+1;
 					while ( uhigh < utop && GRKM[uhigh].code == GRKM[ulow].code )
 						++uhigh;
 
+					// single output
 					GRKM[uout++] = GRKM[ulow];
+
+					uint64_t const s = GRKM[ulow].high-GRKM[ulow].low;
+					if ( s < histthres )
+						thist [ s ] += 1;
+					else
+						thist [ histthres ] += s;
 
 					ulow = uhigh;
 				}
 
+				// size of package
 				usize[t-1] = uout - ubounds[t-1];
 			}
+			// compute prefix sums
 			libmaus2::util::PrefixSums::prefixSums(usize.begin(),usize.end());
+
+			// merge histograms
+			uint64_t const tperthread = (histmult + numthreads - 1)/numthreads;
+			#if defined(_OPENMP)
+			#pragma omp parallel for num_threads(numthreads)
+			#endif
+			for ( uint64_t t = 0; t < numthreads; ++t )
+			{
+				uint64_t const tlow = t * tperthread;
+				uint64_t const thigh = std::min ( tlow + tperthread, histmult );
+
+				uint64_t * const T = Ahist[0]->begin();
+
+				for ( uint64_t j = 1; j < numthreads; ++j )
+				{
+					uint64_t * const S = Ahist[j]->begin();
+
+					for ( uint64_t i = tlow; i < thigh; ++i )
+						T[i] += S[i];
+				}
+			}
+
+			#if 0
+			for ( uint64_t i = 0; i < histmult; ++i )
+				if ( (*(Ahist[0]))[i] )
+				{
+					std::cerr << "[H] " << i << " " << (*(Ahist[0]))[i] << std::endl;
+				}
+			#endif
+
+			// concatenate unique
 			uint64_t gc = 0;
 			libmaus2::parallel::PosixSpinLock gclock;
 			#if defined(_OPENMP)
