@@ -69,6 +69,7 @@
 #include <libmaus2/util/WriteableString.hpp>
 #include <libmaus2/fastx/StreamFastAReader.hpp>
 #include <libmaus2/util/MemoryStatistics.hpp>
+#include <libmaus2/fastx/FastAIndexGenerator.hpp>
 
 // damapper interface
 
@@ -272,195 +273,8 @@ struct DalignerInfo
 	}
 };
 
-
-struct DNAIndex
+struct DNAIndexBase
 {
-	std::string fastaname;
-	std::string rcfastaname;
-	std::string fainame;
-	std::string basefn;
-	std::string replname;
-	std::string compactname;
-	std::string metaname;
-	std::string bwtfn;
-	std::string bpname;
-	std::string saname;
-	std::string compactsaname;
-	std::string compactsametaname;
-	uint64_t n;
-	unsigned int nbits;
-	std::string dnarankname;
-	std::string membpname;
-
-	libmaus2::fastx::FastAIndex::unique_ptr_type PFAI;
-	libmaus2::rank::DNARank::unique_ptr_type PDNA;
-	libmaus2::fastx::DNAIndexMetaDataBigBand::unique_ptr_type Pindex;
-	libmaus2::rank::DNARankKmerCache::unique_ptr_type PKcache;
-	libmaus2::bitio::CompactArray::unique_ptr_type PSSA;
-	libmaus2::fastx::CoordinateCache::unique_ptr_type PCC;
-
-	uint64_t sasamplingrate;
-	uint64_t sasamplingmask;
-	unsigned int sashift;
-
-	libmaus2::bambam::BamHeader::unique_ptr_type getBamHeader()
-	{
-		std::ostringstream samheaderstr;
-		samheaderstr << "@HD\tVN:1.5\tSO:unknown\n";
-		for ( uint64_t i = 0; i < PFAI->size(); ++i )
-		{
-			libmaus2::fastx::FastAIndexEntry const & entry = (*PFAI)[i];
-			samheaderstr << "@SQ\tSN:" << entry.name << "\tLN:" << entry.length << "\n";
-		}
-		// std::cerr << samheaderstr.str();
-		libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(new libmaus2::bambam::BamHeader(samheaderstr.str()));
-
-		return UNIQUE_PTR_MOVE(Pbamheader);
-	}
-
-	void loadBP(std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> & Vseqmeta, libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> & Aseq, uint64_t const numthreads)
-	{
-		libmaus2::aio::InputStreamInstance::unique_ptr_type membpISI(new libmaus2::aio::InputStreamInstance(membpname));
-		libmaus2::fastx::FastaBPDecoderIdentity fabpdec(*membpISI);
-		fabpdec.decodeSequencesParallel(membpname,numthreads,Aseq,Vseqmeta,true /* map */,4 /* pad symbol */,false /* addrc */);
-		assert ( Vseqmeta.size() == PFAI->size() );
-	}
-
-	uint64_t getNumPosBits() const
-	{
-		uint64_t maxl = 0;
-		for ( uint64_t i = 0; i < PFAI->size(); ++i )
-		{
-			uint64_t const l = (*PFAI)[i].length;
-			maxl = std::max(l,maxl);
-		}
-		return maxl ? libmaus2::math::numbits(maxl-1) : 0;
-	}
-
-	uint64_t getNumPosBytes() const
-	{
-		uint64_t const numposbits = getNumPosBits();
-		uint64_t const numposbytes = (numposbits+7)/8;
-		return numposbytes;
-	}
-
-	uint64_t getNumSeqBits() const
-	{
-		return PFAI->size() ? libmaus2::math::numbits(PFAI->size()-1) : 0;
-	}
-
-	uint64_t getNumSeqBytes() const
-	{
-		uint64_t const numseqbits = getNumSeqBits();
-		return (numseqbits+7)/8;
-	}
-
-	struct Kmer
-	{
-		uint64_t code;
-		uint64_t id;
-		uint64_t pos;
-
-		Kmer(uint64_t const rcode = 0, uint64_t const rid = 0, uint64_t const rpos = 0)
-		: code(rcode), id(rid), pos(rpos)
-		{
-
-		}
-
-		bool operator<(Kmer const & O) const
-		{
-			if ( code != O.code )
-				return code < O.code;
-			else if ( id != O.id )
-				return id < O.id;
-			else
-				return pos < O.pos;
-		}
-	};
-
-	static void fillKmerVector(std::vector<Kmer> & V, HITS_DB & refdb, char const * Aseq, unsigned int const k)
-	{
-		V.resize(0);
-
-		for ( int64_t r = 0; r < refdb.ureads; ++r )
-		{
-			char const * base = Aseq + refdb.reads[r].boff;
-			uint64_t const len = refdb.reads[r].rlen;
-
-			if ( len >= k )
-			{
-				uint64_t const numk = len+1-k;
-
-				for ( uint64_t i = 0; i < numk; ++i )
-				{
-					uint64_t v = 0;
-					for ( uint64_t j = 0; j < k; ++j )
-					{
-						v <<= 2;
-						v |= (base[i+j]&3);
-					}
-					V.push_back(Kmer(v,r,i));
-				}
-			}
-		}
-	}
-
-	void fillDazzlerDB(
-		HITS_DB & refdb, libmaus2::autoarray::AutoArray< HITS_READ > & AREFHITREADS, std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> const & Vseqmeta, char * Aseq
-	) const
-	{
-		// set up HITS_DB data structure for reference
-		uint64_t refmaxlen = 0;
-		uint64_t reftotlen = 0;
-		for ( uint64_t i = 0; i < PFAI->size(); ++i )
-		{
-			uint64_t const l = (*PFAI)[i].length;
-			refmaxlen = std::max(refmaxlen,l);
-			reftotlen += l;
-		}
-
-		AREFHITREADS.ensureSize(PFAI->size() + 2);
-		static char refpath[] = "ref.db";
-
-		refdb.ureads = PFAI->size();
-		refdb.treads = PFAI->size();
-		refdb.cutoff = -1;
-		refdb.all = 0;
-		refdb.freq[0] = refdb.freq[1] = refdb.freq[2] = refdb.freq[3] = 0.25;
-		refdb.maxlen = refmaxlen;
-		refdb.totlen = reftotlen;
-		refdb.nreads = PFAI->size();
-		refdb.trimmed = 1;
-		refdb.part = 0;
-		refdb.ufirst = 0;
-		refdb.tfirst = 0;
-		refdb.path = &refpath[0];
-		refdb.loaded = 1;
-		refdb.bases = reinterpret_cast<void *>(Aseq);
-		refdb.reads = AREFHITREADS.begin() + 1;
-		refdb.tracks = NULL;
-
-		for ( uint64_t i = 0; i < Vseqmeta.size(); ++i )
-		{
-			refdb.reads[i].origin = i;
-			refdb.reads[i].rlen = Vseqmeta[i].length;
-			refdb.reads[i].fpulse = 0;
-			refdb.reads[i].boff = Vseqmeta[i].firstbase;
-			assert ( (Aseq + Vseqmeta[i].firstbase)[-1] == 4 );
-			refdb.reads[i].coff = -1;
-			refdb.reads[i].flags = DB_BEST;
-		}
-
-		(reinterpret_cast<int*>(refdb.reads))[-1] = PFAI->size();
-		(reinterpret_cast<int*>(refdb.reads))[-2] = PFAI->size();
-	}
-
-	libmaus2::bitio::CompactArray::unique_ptr_type loadText() const
-	{
-		libmaus2::bitio::CompactArray::unique_ptr_type ptext(libmaus2::bitio::CompactArray::load(compactname));
-		return UNIQUE_PTR_MOVE(ptext);
-	}
-
 	static uint64_t readSamplingRate(std::string const & fn)
 	{
 		libmaus2::aio::InputStreamInstance ISI(fn);
@@ -474,82 +288,7 @@ struct DNAIndex
 		return UNIQUE_PTR_MOVE(CA);
 	}
 
-	void loadSampledSuffixArray(int const verbose)
-	{
-		if ( verbose > 1 )
-			std::cerr << "[V] loading sampled suffix array...";
-		sasamplingrate = readSamplingRate(compactsametaname);
-		sasamplingmask = sasamplingrate-1;
-		sashift = libmaus2::math::ilog(sasamplingrate);
-		assert ( sasamplingrate == 1ull<<sashift );
-		libmaus2::bitio::CompactArray::unique_ptr_type tSSA(loadCompactArray(compactsaname));
-		PSSA = UNIQUE_PTR_MOVE(tSSA);
-		if ( verbose > 1 )
-			std::cerr << "done, rate " << sasamplingrate << std::endl;
-	}
-
-	void setupFromForwardCompact(
-		std::string const & rfastaname,
-		std::string const & rfainame,
-		std::string const & forwcompact,
-		std::string const & forwmetaname,
-		std::string const & forwreplname,
-		int const verbose,
-		size_t constrsasamplingrate,
-		size_t constrisasamplingrate,
-		uint64_t bwtconstrmem,
-		unsigned int const numthreads,
-		unsigned int const cache_k
-	)
-	{
-		fastaname = rfastaname;
-		fainame = rfainame;
-		metaname = forwmetaname;
-
-		// base name (clip .fasta suffix from index)
-		basefn = libmaus2::util::OutputFileNameTools::clipOff(fastaname,".fasta") + "_rc";
-		replname = basefn + ".repl.fasta";
-		bpname = basefn + ".repl.fasta.bp";
-
-		// generate fasta with replacements
-		generateRCFasta(forwreplname, replname);
-
-		compactname = basefn + ".compact";
-
-		loadFAI(verbose);
-		generateCompactRCFromCompact(forwcompact, compactname, verbose);
-		generateBP(replname,bpname,verbose);
-
-		//  bwt fn
-		bwtfn = basefn + ".bwt";
-
-		generateBwt(compactname,bwtfn,constrsasamplingrate,constrisasamplingrate,bwtconstrmem,numthreads);
-
-		// file name of sampled suffix array (8 bytes per value)
-		saname = basefn + ".sa";
-		// compacted version of sampled suffix array (minimal number of bits per value in block code)
-		compactsaname = saname + ".compact";
-		compactsametaname = saname + ".compact.meta";
-
-		n = libmaus2::huffman::RLDecoder::getLength(bwtfn,numthreads);
-		nbits = n ? libmaus2::math::numbits(n-1) : 0;
-		generateCompactSA(saname,compactsaname,compactsametaname,verbose,n,nbits);
-
-		dnarankname = basefn + ".dnarank";
-		generateDNARank(bwtfn,dnarankname,numthreads,verbose);
-
-		loadDNARank(verbose);
-		loadKMerCache(cache_k, numthreads, verbose);
-		loadDNARankIndex(verbose);
-		loadCoordinateCache(verbose);
-
-		membpname = "mem://damapper_bwt_reco_bp";
-		setupMemBP(verbose);
-
-		loadSampledSuffixArray(verbose);
-	}
-
-	void generateRCFasta(std::string const & fastaname, std::string const & rcfastaname)
+	static void generateRCFasta(std::string const & fastaname, std::string const & rcfastaname)
 	{
 		if ( (! libmaus2::util::GetFileSize::fileExists(rcfastaname)) || (libmaus2::util::GetFileSize::isOlder(rcfastaname,fastaname)) )
 		{
@@ -569,86 +308,11 @@ struct DNAIndex
 		}
 	}
 
-	void setupFromFasta(
-		std::string const & rfastaname,
-		int const verbose,
-		size_t constrsasamplingrate,
-		size_t constrisasamplingrate,
-		uint64_t bwtconstrmem,
-		unsigned int const numthreads,
-		unsigned int const cache_k
+	static void generateCompactRCFromCompact(
+		std::string const & compactname, std::string const & compactrcname,
+		libmaus2::fastx::FastAIndex const * PFAI,
+		int verbose
 	)
-	{
-		fastaname = rfastaname;
-		fainame = fastaname + ".fai";
-		generateFaIdx(fastaname,fainame,verbose);
-
-		// base name (clip .fasta suffix from index)
-		basefn = libmaus2::util::OutputFileNameTools::clipOff(fastaname,".fasta");
-
-		// FastA with symbol replacements (N->random bases)
-		compactname = basefn + ".compact";
-		replname = compactname + ".repl.fasta";
-		// compact stream meta data name
-		metaname = compactname + ".meta";
-
-		generateReplAndCompact(fastaname,replname,compactname);
-
-		//  bwt fn
-		bwtfn = basefn + ".bwt";
-
-		generateBwt(compactname,bwtfn,constrsasamplingrate,constrisasamplingrate,bwtconstrmem,numthreads);
-
-		// compacted version of replname file
-		bpname = compactname + ".repl.fasta.bp";
-
-		generateBP(replname,bpname,verbose);
-
-		// file name of sampled suffix array (8 bytes per value)
-		saname = basefn + ".sa";
-		// compacted version of sampled suffix array (minimal number of bits per value in block code)
-		compactsaname = saname + ".compact";
-		compactsametaname = saname + ".compact.meta";
-
-		n = libmaus2::huffman::RLDecoder::getLength(bwtfn,numthreads);
-		nbits = n ? libmaus2::math::numbits(n-1) : 0;
-		generateCompactSA(saname,compactsaname,compactsametaname,verbose,n,nbits);
-
-		dnarankname = basefn + ".dnarank";
-		generateDNARank(bwtfn,dnarankname,numthreads,verbose);
-
-		loadFAI(verbose);
-		loadDNARank(verbose);
-		loadDNARankIndex(verbose);
-		loadKMerCache(cache_k, numthreads, verbose);
-		loadCoordinateCache(verbose);
-
-		// in memory name for bpname file
-		membpname = "mem://damapper_bwt_forw_bp";
-		setupMemBP(verbose);
-
-		loadSampledSuffixArray(verbose);
-	}
-
-	DNAIndex()
-	{
-
-	}
-
-	uint64_t lookupSA(uint64_t const jr) const
-	{
-		if ( sasamplingrate == 1 )
-		{
-			return (*(PSSA))[jr];
-		}
-		else
-		{
-			std::pair<uint64_t,uint64_t> const SP = PDNA->simpleLFUntilMask(jr, sasamplingmask);
-			return ((*(PSSA))[SP.first >> sashift] + SP.second)%PDNA->size();
-		}
-	}
-
-	void generateCompactRCFromCompact(std::string const & compactname, std::string const & compactrcname, int verbose)
 	{
 		// compute compact rc file
 		if ( (! libmaus2::util::GetFileSize::fileExists(compactrcname)) || (libmaus2::util::GetFileSize::isOlder(compactrcname,compactname)) )
@@ -679,77 +343,6 @@ struct DNAIndex
 				std::cerr << "done." << std::endl;
 		}
 
-	}
-
-	void setupMemBP(int const verbose)
-	{
-		if ( verbose > 1 )
-			std::cerr << "[V] loading " << bpname << "...";
-		{
-			libmaus2::aio::InputStreamInstance::unique_ptr_type bpISI(new libmaus2::aio::InputStreamInstance(bpname));
-			libmaus2::aio::OutputStreamInstance::unique_ptr_type membpOSI(new libmaus2::aio::OutputStreamInstance(membpname));
-			bpISI->seekg(0,std::ios::end);
-			uint64_t const l = bpISI->tellg();
-			bpISI->clear();
-			bpISI->seekg(0,std::ios::beg);
-			bpISI->clear();
-			libmaus2::util::GetFileSize::copy(*bpISI,*membpOSI,l);
-			membpOSI->flush();
-			membpOSI.reset();
-			bpISI.reset();
-		}
-		if ( verbose > 1 )
-			std::cerr << "done." << std::endl;
-	}
-
-	void loadFAI(int const verbose)
-	{
-		if ( verbose > 1 )
-			std::cerr << "[V] loading FastA (.fai) index...";
-		libmaus2::fastx::FastAIndex::unique_ptr_type tPFAI(libmaus2::fastx::FastAIndex::load(fainame));
-		PFAI = UNIQUE_PTR_MOVE(tPFAI);
-		if ( verbose > 1 )
-			std::cerr << "done." << std::endl;
-	}
-
-	void loadDNARank(int const verbose)
-	{
-		if ( verbose > 1 )
-			std::cerr << "[V] loading rank data structure...";
-		libmaus2::rank::DNARank::unique_ptr_type tPDNA(libmaus2::rank::DNARank::loadFromSerialised(dnarankname));
-		PDNA = UNIQUE_PTR_MOVE(tPDNA);
-		if ( verbose > 1 )
-			std::cerr << "done." << std::endl;
-	}
-
-	void loadDNARankIndex(int const verbose)
-	{
-		if ( verbose > 1 )
-			std::cerr << "[V] loading DNA index meta data...";
-		libmaus2::fastx::DNAIndexMetaDataBigBand::unique_ptr_type tPindex(libmaus2::fastx::DNAIndexMetaDataBigBand::load(metaname));
-		Pindex = UNIQUE_PTR_MOVE(tPindex);
-		if ( verbose > 1 )
-			std::cerr << "done." << std::endl;
-	}
-
-	void loadKMerCache(unsigned int const cache_k, uint64_t const numthreads, int const verbose)
-	{
-		if ( verbose > 1 )
-			std::cerr << "[V] computing " << cache_k << "-mer cache...";
-		libmaus2::rank::DNARankKmerCache::unique_ptr_type tKcache(new libmaus2::rank::DNARankKmerCache(*PDNA,cache_k,numthreads));
-		PKcache = UNIQUE_PTR_MOVE(tKcache);
-		if ( verbose > 1 )
-			std::cerr << "done." << std::endl;
-	}
-
-	void loadCoordinateCache(int const verbose)
-	{
-		if ( verbose > 1 )
-			std::cerr << "[V] constructing coordinate cache...";
-		libmaus2::fastx::CoordinateCache::unique_ptr_type tCC(new libmaus2::fastx::CoordinateCache(*PDNA,*Pindex,16));
-		PCC = UNIQUE_PTR_MOVE(tCC);
-		if ( verbose > 1 )
-			std::cerr << "done." << std::endl;
 	}
 
 	static void generateDNARank(std::string const & bwtfn, std::string const & dnarankname, uint64_t const numthreads, int const verbose)
@@ -812,7 +405,7 @@ struct DNAIndex
 
 	}
 
-	static void generateBP(std::string const & replname, std::string const & bpname, int const verbose)
+	static uint64_t generateBP(std::string const & replname, std::string const & bpname, int const verbose)
 	{
 		if ( (! libmaus2::util::GetFileSize::fileExists(bpname)) || (libmaus2::util::GetFileSize::isOlder(bpname,replname) ) )
 		{
@@ -820,75 +413,18 @@ struct DNAIndex
 				std::cerr << "[V] creating " << bpname << "...";
 			libmaus2::aio::InputStreamInstance::unique_ptr_type replISI(new libmaus2::aio::InputStreamInstance(replname));
 			libmaus2::aio::OutputStreamInstance::unique_ptr_type bpOSI(new libmaus2::aio::OutputStreamInstance(bpname));
-			libmaus2::fastx::FastABPGenerator::fastAToFastaBP(*replISI,*bpOSI,&std::cerr,64*1024 /* bs */);
+			uint64_t const s = libmaus2::fastx::FastABPGenerator::fastAToFastaBP(*replISI,*bpOSI,&std::cerr,64*1024 /* bs */);
 			bpOSI->flush();
 			bpOSI.reset();
 			replISI.reset();
 			if ( verbose > 0 )
 				std::cerr << "done." << std::endl;
+
+			return s;
 		}
-
-	}
-
-	static void generateFaIdx(std::string const & fastaname, std::string const & fainame, int const verbose)
-	{
-		// generate modified and compact fasta files if they do not exist
-		if ( (! libmaus2::util::GetFileSize::fileExists(fainame)) || (libmaus2::util::GetFileSize::isOlder(fainame,fastaname) ) )
+		else
 		{
-			if ( verbose > 0 )
-				std::cerr << "[V] generating " << fainame << "...";
-
-			libmaus2::aio::InputStreamInstance ISI(fastaname);
-			libmaus2::aio::OutputStreamInstance OSI(fainame);
-			libmaus2::util::LineBuffer LB(ISI, 8*1024);
-			libmaus2::fastx::SpaceTable ST;
-
-			char const * a = 0;
-			char const * e = 0;
-
-			std::string seqname;
-			int64_t linewidth = -1;
-			int64_t linelength = -1;
-			uint64_t seqlength = 0;
-			uint64_t seqoffset = 0;
-			uint64_t o = 0;
-
-			while ( LB.getline(&a,&e) )
-			{
-				if ( e-a && *a == '>' )
-				{
-					if ( seqname.size() )
-						OSI << seqname << "\t" << seqlength << "\t" << seqoffset << "\t" << linewidth << "\t" << linelength << std::endl;
-
-					seqname = libmaus2::fastx::FastAIndex::computeShortName(std::string(a+1,e));
-					linewidth = -1;
-					linelength = -1;
-					seqlength = 0;
-				}
-				else
-				{
-					uint64_t nonspace = 0;
-					for ( char const * c = a; c != e && !ST.spacetable[static_cast<uint8_t>(static_cast<unsigned char>(*c))]; ++c )
-						++nonspace;
-
-					if ( linewidth < 0 )
-					{
-
-						linewidth = nonspace;
-						linelength = e-a + 1 /* newline */;
-						seqoffset = o;
-					}
-
-					seqlength += nonspace;
-				}
-
-				o += (e-a)+1;
-			}
-			if ( seqname.size() )
-				OSI << seqname << "\t" << seqlength << "\t" << seqoffset << "\t" << linewidth << "\t" << linelength << std::endl;
-
-			if ( verbose > 0 )
-				std::cerr << "done." << std::endl;
+			return libmaus2::util::GetFileSize::getFileSize(bpname);
 		}
 	}
 
@@ -949,12 +485,491 @@ struct DNAIndex
 
 			res.computeSampledSuffixArray(constrsasamplingrate /* sa */, iconstrsasamplingrate /* isa */,bwtfn + "_tmp",true /* copy input to memory */,
 				numthreads,
-				16*1024ull*1024ull*1024ull, /* max sort mem */
+				bwtconstrmem, /* max sort mem */
 				64, /* max tmp files */
 				&(std::cerr)
 			);
 		}
+	}
 
+	static uint64_t rewriteFAI(std::ostream & out, std::string const & fainame)
+	{
+		libmaus2::fastx::FastAIndex::unique_ptr_type tPFAI(libmaus2::fastx::FastAIndex::load(fainame));
+		return tPFAI->serialise(out);
+	}
+
+	static uint64_t rewriteGeneric(std::ostream & out, std::string const & fn)
+	{
+		uint64_t const s = libmaus2::util::GetFileSize::getFileSize(fn);
+		libmaus2::aio::InputStreamInstance ISI(fn);
+		libmaus2::util::GetFileSize::copy(ISI,out,s);
+		return s;
+	}
+
+	static uint64_t rewriteDNARank(std::ostream & out, std::string const & dnarankname)
+	{
+		return rewriteGeneric(out,dnarankname);
+	}
+
+	static uint64_t rewriteDNAIndexMetaDataBigBand(std::ostream & out, std::string const & index)
+	{
+		return rewriteGeneric(out,index);
+	}
+
+	static uint64_t rewriteCompactSampledSuffixArray(std::ostream & out, std::string const & meta, std::string const & fn)
+	{
+		uint64_t s = 0;
+		uint64_t const sasamplingrate = readSamplingRate(meta);
+		s += libmaus2::util::NumberSerialisation::serialiseNumber(out,sasamplingrate);
+		s += rewriteGeneric(out,fn);
+		return s;
+	}
+
+	static uint64_t rewriteBP(std::ostream & out, std::string const & bp)
+	{
+		uint64_t s = 0;
+		uint64_t const fs = libmaus2::util::GetFileSize::getFileSize(bp);
+		s += libmaus2::util::NumberSerialisation::serialiseNumber(out,fs);
+		s += rewriteGeneric(out,bp);
+		return s;
+	}
+};
+
+struct DNAIndexBuild : public DNAIndexBase
+{
+	std::string fastaname;
+	std::string rcfastaname;
+	std::string fainame;
+	std::string basefn;
+	std::string replname;
+	std::string compactname;
+	std::string metaname;
+	std::string bwtfn;
+	std::string bpname;
+	std::string saname;
+	std::string compactsaname;
+	std::string compactsametaname;
+	std::string dnarankname;
+
+	std::string histfn;
+	std::string isafn;
+	std::string preisafn;
+	std::string preisametafn;
+
+	void cleanup() const
+	{
+		libmaus2::aio::FileRemoval::removeFile(rcfastaname);
+		libmaus2::aio::FileRemoval::removeFile(fainame);
+		libmaus2::aio::FileRemoval::removeFile(replname);
+		libmaus2::aio::FileRemoval::removeFile(compactname);
+		libmaus2::aio::FileRemoval::removeFile(metaname);
+		libmaus2::aio::FileRemoval::removeFile(bwtfn);
+		libmaus2::aio::FileRemoval::removeFile(bpname);
+		libmaus2::aio::FileRemoval::removeFile(saname);
+		libmaus2::aio::FileRemoval::removeFile(compactsaname);
+		libmaus2::aio::FileRemoval::removeFile(compactsametaname);
+		libmaus2::aio::FileRemoval::removeFile(dnarankname);
+		libmaus2::aio::FileRemoval::removeFile(histfn);
+		libmaus2::aio::FileRemoval::removeFile(isafn);
+		libmaus2::aio::FileRemoval::removeFile(preisafn);
+		libmaus2::aio::FileRemoval::removeFile(preisametafn);
+	}
+
+	uint64_t n;
+	unsigned int nbits;
+
+	libmaus2::fastx::FastAIndex::unique_ptr_type PFAI;
+
+	void loadFAI(std::string const & fainame, int const verbose)
+	{
+		if ( verbose > 1 )
+			std::cerr << "[V] loading FastA (.fai) index...";
+		libmaus2::fastx::FastAIndex::unique_ptr_type tPFAI(libmaus2::fastx::FastAIndex::load(fainame));
+		PFAI = UNIQUE_PTR_MOVE(tPFAI);
+		if ( verbose > 1 )
+			std::cerr << "done." << std::endl;
+	}
+
+	void setupFromForwardCompact(
+		std::string const & rfastaname,
+		std::string const & tmpprefix,
+		std::string const & rfainame,
+		// compact for forward
+		std::string const & forwcompact,
+		// compact file meta data for forward
+		std::string const & forwmetaname,
+		// repl fasta for forward
+		std::string const & forwreplname,
+		int const verbose,
+		size_t constrsasamplingrate,
+		size_t constrisasamplingrate,
+		uint64_t bwtconstrmem,
+		unsigned int const numthreads,
+		std::ostream & OSI
+	)
+	{
+		fastaname = rfastaname;
+		fainame = rfainame;
+		metaname = forwmetaname;
+
+		// base name (clip .fasta suffix from index)
+		// basefn = libmaus2::util::OutputFileNameTools::clipOff(fastaname,".fasta") + "_rc";
+		basefn = tmpprefix + "_rc";
+		replname = basefn + ".repl.fasta";
+		bpname = basefn + ".repl.fasta.bp";
+
+		histfn = basefn + ".hist";
+		isafn = basefn + ".isa";
+		preisafn = basefn + ".preisa";
+		preisametafn = preisafn + ".meta";
+
+		// generate fasta with replacements
+		generateRCFasta(forwreplname, replname);
+
+		compactname = basefn + ".compact";
+
+		loadFAI(fainame,verbose);
+		/* static */ generateCompactRCFromCompact(forwcompact, compactname, PFAI.get(), verbose);
+		/* static */ generateBP(replname,bpname,verbose);
+
+		//  bwt fn
+		bwtfn = basefn + ".bwt";
+
+		generateBwt(compactname,bwtfn,constrsasamplingrate,constrisasamplingrate,bwtconstrmem,numthreads);
+
+		// file name of sampled suffix array (8 bytes per value)
+		saname = basefn + ".sa";
+		// compacted version of sampled suffix array (minimal number of bits per value in block code)
+		compactsaname = saname + ".compact";
+		compactsametaname = saname + ".compact.meta";
+
+		n = libmaus2::huffman::RLDecoder::getLength(bwtfn,numthreads);
+		nbits = n ? libmaus2::math::numbits(n-1) : 0;
+		/* static */ generateCompactSA(saname,compactsaname,compactsametaname,verbose,n,nbits);
+
+		dnarankname = basefn + ".dnarank";
+		/* static */ generateDNARank(bwtfn,dnarankname,numthreads,verbose);
+
+		uint64_t s = 0;
+		// std::string const combfn = basefn + "_damapper_bwt_forward_index";
+		// libmaus2::aio::OutputStreamInstance::unique_ptr_type OSI(new libmaus2::aio::OutputStreamInstance(combfn));
+		s += rewriteFAI(OSI,fainame);
+		s += rewriteDNARank(OSI,dnarankname);
+		s += rewriteDNAIndexMetaDataBigBand(OSI,metaname);
+		s += rewriteCompactSampledSuffixArray(OSI,compactsametaname,compactsaname);
+		s += rewriteBP(OSI,bpname);
+		OSI.flush();
+	}
+
+	// main setup for forward index
+	void setupFromFasta(
+		std::string const & rfastaname,
+		std::string const & tmpprefix,
+		int const verbose,
+		size_t constrsasamplingrate,
+		size_t constrisasamplingrate,
+		uint64_t bwtconstrmem,
+		unsigned int const numthreads,
+		std::ostream & OSI
+	)
+	{
+		fastaname = rfastaname;
+
+		fainame = tmpprefix + ".fai";
+
+		// base name (clip .fasta suffix from index)
+		basefn = tmpprefix + "_forward"; // libmaus2::util::OutputFileNameTools::clipOff(fastaname,".fasta");
+
+		// FastA with symbol replacements (N->random bases)
+		compactname = basefn + ".compact";
+		replname = compactname + ".repl.fasta";
+		// compact stream meta data name
+		metaname = compactname + ".meta";
+		//  bwt fn
+		bwtfn = basefn + ".bwt";
+		// compacted version of replname file
+		bpname = compactname + ".repl.fasta.bp";
+		// file name of sampled suffix array (8 bytes per value)
+		saname = basefn + ".sa";
+		// compacted version of sampled suffix array (minimal number of bits per value in block code)
+		compactsaname = saname + ".compact";
+		compactsametaname = saname + ".compact.meta";
+		// dnarank name
+		dnarankname = basefn + ".dnarank";
+
+		histfn = basefn + ".hist";
+		isafn = basefn + ".isa";
+		preisafn = basefn + ".preisa";
+		preisametafn = preisafn + ".meta";
+
+		// generate fasta index
+		libmaus2::fastx::FastAIndexGenerator::generate(fastaname,fainame,verbose);
+
+		// generate file with base replacements and compact file
+		// this generate compactname, replname
+		/* static */ generateReplAndCompact(fastaname,replname,compactname);
+
+		// generate BWT + sampled suffix array
+		/* static */ generateBwt(compactname,bwtfn,constrsasamplingrate,constrisasamplingrate,bwtconstrmem,numthreads);
+
+		// get length of text
+		n = libmaus2::huffman::RLDecoder::getLength(bwtfn,numthreads);
+		// number of bits per suffix array element
+		nbits = n ? libmaus2::math::numbits(n-1) : 0;
+
+		// generate BP file from replacement fasta
+		/* static */ generateBP(replname,bpname,verbose);
+
+		// generate compact suffix array
+		/* static */ generateCompactSA(saname,compactsaname,compactsametaname,verbose,n,nbits);
+
+		// generate DNA rank index structure
+		generateDNARank(bwtfn,dnarankname,numthreads,verbose);
+
+		uint64_t s = 0;
+		// std::string const combfn = basefn + "_damapper_bwt_forward_index";
+		// libmaus2::aio::OutputStreamInstance::unique_ptr_type OSI(new libmaus2::aio::OutputStreamInstance(combfn));
+		s += rewriteFAI(OSI,fainame);
+		s += rewriteDNARank(OSI,dnarankname);
+		s += rewriteDNAIndexMetaDataBigBand(OSI,metaname);
+		s += rewriteCompactSampledSuffixArray(OSI,compactsametaname,compactsaname);
+		s += rewriteBP(OSI,bpname);
+		OSI.flush();
+	}
+};
+
+struct DNAIndex : public DNAIndexBase
+{
+	std::string membpname;
+
+	libmaus2::fastx::FastAIndex::unique_ptr_type PFAI;
+	libmaus2::rank::DNARank::unique_ptr_type PDNA;
+	libmaus2::fastx::DNAIndexMetaDataBigBand::unique_ptr_type Pindex;
+	libmaus2::rank::DNARankKmerCache::unique_ptr_type PKcache;
+	libmaus2::bitio::CompactArray::unique_ptr_type PSSA;
+	libmaus2::fastx::CoordinateCache::unique_ptr_type PCC;
+
+	uint64_t n;
+	unsigned int nbits;
+
+	uint64_t sasamplingrate;
+	uint64_t sasamplingmask;
+	unsigned int sashift;
+
+	libmaus2::bambam::BamHeader::unique_ptr_type getBamHeader()
+	{
+		std::ostringstream samheaderstr;
+		samheaderstr << "@HD\tVN:1.5\tSO:unknown\n";
+		for ( uint64_t i = 0; i < PFAI->size(); ++i )
+		{
+			libmaus2::fastx::FastAIndexEntry const & entry = (*PFAI)[i];
+			samheaderstr << "@SQ\tSN:" << entry.name << "\tLN:" << entry.length << "\n";
+		}
+		// std::cerr << samheaderstr.str();
+		libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(new libmaus2::bambam::BamHeader(samheaderstr.str()));
+
+		return UNIQUE_PTR_MOVE(Pbamheader);
+	}
+
+	void loadBP(std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> & Vseqmeta, libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> & Aseq, uint64_t const numthreads)
+	{
+		libmaus2::aio::InputStreamInstance::unique_ptr_type membpISI(new libmaus2::aio::InputStreamInstance(membpname));
+		libmaus2::fastx::FastaBPDecoderIdentity fabpdec(*membpISI);
+		fabpdec.decodeSequencesParallel(membpname,numthreads,Aseq,Vseqmeta,true /* map */,4 /* pad symbol */,false /* addrc */);
+		assert ( Vseqmeta.size() == PFAI->size() );
+	}
+
+	uint64_t getNumPosBits() const
+	{
+		uint64_t maxl = 0;
+		for ( uint64_t i = 0; i < PFAI->size(); ++i )
+		{
+			uint64_t const l = (*PFAI)[i].length;
+			maxl = std::max(l,maxl);
+		}
+		return maxl ? libmaus2::math::numbits(maxl-1) : 0;
+	}
+
+	uint64_t getNumPosBytes() const
+	{
+		uint64_t const numposbits = getNumPosBits();
+		uint64_t const numposbytes = (numposbits+7)/8;
+		return numposbytes;
+	}
+
+	uint64_t getNumSeqBits() const
+	{
+		return PFAI->size() ? libmaus2::math::numbits(PFAI->size()-1) : 0;
+	}
+
+	uint64_t getNumSeqBytes() const
+	{
+		uint64_t const numseqbits = getNumSeqBits();
+		return (numseqbits+7)/8;
+	}
+
+	void fillDazzlerDB(
+		HITS_DB & refdb,
+		libmaus2::autoarray::AutoArray< HITS_READ > & AREFHITREADS,
+		std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> const & Vseqmeta,
+		char * Aseq
+	) const
+	{
+		// set up HITS_DB data structure for reference
+		uint64_t refmaxlen = 0;
+		uint64_t reftotlen = 0;
+		for ( uint64_t i = 0; i < PFAI->size(); ++i )
+		{
+			uint64_t const l = (*PFAI)[i].length;
+			refmaxlen = std::max(refmaxlen,l);
+			reftotlen += l;
+		}
+
+		AREFHITREADS.ensureSize(PFAI->size() + 2);
+		static char refpath[] = "ref.db";
+
+		refdb.ureads = PFAI->size();
+		refdb.treads = PFAI->size();
+		refdb.cutoff = -1;
+		refdb.all = 0;
+		refdb.freq[0] = refdb.freq[1] = refdb.freq[2] = refdb.freq[3] = 0.25;
+		refdb.maxlen = refmaxlen;
+		refdb.totlen = reftotlen;
+		refdb.nreads = PFAI->size();
+		refdb.trimmed = 1;
+		refdb.part = 0;
+		refdb.ufirst = 0;
+		refdb.tfirst = 0;
+		refdb.path = &refpath[0];
+		refdb.loaded = 1;
+		refdb.bases = reinterpret_cast<void *>(Aseq);
+		refdb.reads = AREFHITREADS.begin() + 1;
+		refdb.tracks = NULL;
+
+		for ( uint64_t i = 0; i < Vseqmeta.size(); ++i )
+		{
+			refdb.reads[i].origin = i;
+			refdb.reads[i].rlen = Vseqmeta[i].length;
+			refdb.reads[i].fpulse = 0;
+			refdb.reads[i].boff = Vseqmeta[i].firstbase;
+			assert ( (Aseq + Vseqmeta[i].firstbase)[-1] == 4 );
+			refdb.reads[i].coff = -1;
+			refdb.reads[i].flags = DB_BEST;
+		}
+
+		(reinterpret_cast<int*>(refdb.reads))[-1] = PFAI->size();
+		(reinterpret_cast<int*>(refdb.reads))[-2] = PFAI->size();
+	}
+
+	void loadFromSingleForward(std::istream & ISI, uint64_t const numthreads, unsigned int const cache_k, int const verbose)
+	{
+		// FAI
+		libmaus2::fastx::FastAIndex::unique_ptr_type TFAI(libmaus2::fastx::FastAIndex::loadSerialised(ISI));
+		PFAI = UNIQUE_PTR_MOVE(TFAI);
+
+		// DNARank
+		libmaus2::rank::DNARank::unique_ptr_type tPDNA(libmaus2::rank::DNARank::loadFromSerialised(ISI));
+		PDNA = UNIQUE_PTR_MOVE(tPDNA);
+
+		// DNAIndexMetaDataBigBand
+		libmaus2::fastx::DNAIndexMetaDataBigBand::unique_ptr_type tPindex(libmaus2::fastx::DNAIndexMetaDataBigBand::load(ISI));
+		Pindex = UNIQUE_PTR_MOVE(tPindex);
+
+		// CompactArray
+		sasamplingrate = libmaus2::util::NumberSerialisation::deserialiseNumber(ISI);
+		sasamplingmask = sasamplingrate-1;
+		sashift = libmaus2::math::ilog(sasamplingrate);
+		assert ( sasamplingrate == 1ull<<sashift );
+		libmaus2::bitio::CompactArray::unique_ptr_type tSSA(new libmaus2::bitio::CompactArray(ISI));
+		PSSA = UNIQUE_PTR_MOVE(tSSA);
+
+		loadKMerCache(cache_k, numthreads, verbose);
+		loadCoordinateCache(verbose);
+
+		uint64_t const bpsize = libmaus2::util::NumberSerialisation::deserialiseNumber(ISI);
+		membpname = "mem://damapper_bwt_forw_bp";
+		libmaus2::aio::OutputStreamInstance::unique_ptr_type membpOSI(new libmaus2::aio::OutputStreamInstance(membpname));
+		libmaus2::util::GetFileSize::copy(ISI,*membpOSI,bpsize);
+		membpOSI->flush();
+		membpOSI.reset();
+
+		n = PDNA->size();
+		nbits = n ? libmaus2::math::numbits(n-1) : 0;
+	}
+
+	void loadFromSingleReverseComplement(std::istream & ISI, uint64_t const numthreads, unsigned int const cache_k, int const verbose)
+	{
+		// FAI
+		libmaus2::fastx::FastAIndex::unique_ptr_type TFAI(libmaus2::fastx::FastAIndex::loadSerialised(ISI));
+		PFAI = UNIQUE_PTR_MOVE(TFAI);
+
+		// DNARank
+		libmaus2::rank::DNARank::unique_ptr_type tPDNA(libmaus2::rank::DNARank::loadFromSerialised(ISI));
+		PDNA = UNIQUE_PTR_MOVE(tPDNA);
+
+		// DNAIndexMetaDataBigBand
+		libmaus2::fastx::DNAIndexMetaDataBigBand::unique_ptr_type tPindex(libmaus2::fastx::DNAIndexMetaDataBigBand::load(ISI));
+		Pindex = UNIQUE_PTR_MOVE(tPindex);
+
+		// CompactArray
+		sasamplingrate = libmaus2::util::NumberSerialisation::deserialiseNumber(ISI);
+		sasamplingmask = sasamplingrate-1;
+		sashift = libmaus2::math::ilog(sasamplingrate);
+		assert ( sasamplingrate == 1ull<<sashift );
+		libmaus2::bitio::CompactArray::unique_ptr_type tSSA(new libmaus2::bitio::CompactArray(ISI));
+		PSSA = UNIQUE_PTR_MOVE(tSSA);
+
+		loadKMerCache(cache_k, numthreads, verbose);
+		loadCoordinateCache(verbose);
+
+		uint64_t const bpsize = libmaus2::util::NumberSerialisation::deserialiseNumber(ISI);
+		membpname = "mem://damapper_bwt_reco_bp";
+		libmaus2::aio::OutputStreamInstance::unique_ptr_type membpOSI(new libmaus2::aio::OutputStreamInstance(membpname));
+		libmaus2::util::GetFileSize::copy(ISI,*membpOSI,bpsize);
+		membpOSI->flush();
+		membpOSI.reset();
+
+		n = PDNA->size();
+		nbits = n ? libmaus2::math::numbits(n-1) : 0;
+	}
+
+
+	DNAIndex()
+	{
+
+	}
+
+	uint64_t lookupSA(uint64_t const jr) const
+	{
+		if ( sasamplingrate == 1 )
+		{
+			return (*(PSSA))[jr];
+		}
+		else
+		{
+			std::pair<uint64_t,uint64_t> const SP = PDNA->simpleLFUntilMask(jr, sasamplingmask);
+			return ((*(PSSA))[SP.first >> sashift] + SP.second)%PDNA->size();
+		}
+	}
+
+	void loadKMerCache(unsigned int const cache_k, uint64_t const numthreads, int const verbose)
+	{
+		if ( verbose > 1 )
+			std::cerr << "[V] computing " << cache_k << "-mer cache...";
+		libmaus2::rank::DNARankKmerCache::unique_ptr_type tKcache(new libmaus2::rank::DNARankKmerCache(*PDNA,cache_k,numthreads));
+		PKcache = UNIQUE_PTR_MOVE(tKcache);
+		if ( verbose > 1 )
+			std::cerr << "done." << std::endl;
+	}
+
+	void loadCoordinateCache(int const verbose)
+	{
+		if ( verbose > 1 )
+			std::cerr << "[V] constructing coordinate cache...";
+		libmaus2::fastx::CoordinateCache::unique_ptr_type tCC(new libmaus2::fastx::CoordinateCache(*PDNA,*Pindex,16));
+		PCC = UNIQUE_PTR_MOVE(tCC);
+		if ( verbose > 1 )
+			std::cerr << "done." << std::endl;
 	}
 };
 
@@ -980,6 +995,7 @@ struct ReadInterval
 
 int damapper_bwt(libmaus2::util::ArgParser const & arg)
 {
+
 	// default k
 	unsigned int const defk = 20;
 	unsigned int const k = arg.argPresent("k") ? arg.getUnsignedNumericArg<uint64_t>("k") : defk;
@@ -1026,10 +1042,42 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	}
 
 	std::string const fastaname = arg[0];
+	std::string const combfn = fastaname + ".damapper_bwt";
+
+	if (
+		(! libmaus2::util::GetFileSize::fileExists(combfn))
+		||
+		libmaus2::util::GetFileSize::isOlder(combfn,fastaname)
+	)
+	{
+		DNAIndexBuild forwindex;
+		DNAIndexBuild rcindex;
+
+		std::string const tmpprefix = arg.uniqueArgPresent("T") ? arg["T"] : libmaus2::util::ArgInfo::getDefaultTmpFileName(arg.progname);
+		std::string const indexcreatefn = tmpprefix + "_damapper_bwt_index_create";
+		libmaus2::util::TempFileRemovalContainer::addTempFile(indexcreatefn);
+
+		libmaus2::aio::OutputStreamInstance::unique_ptr_type combOSI(new libmaus2::aio::OutputStreamInstance(indexcreatefn));
+		forwindex.setupFromFasta(fastaname,tmpprefix,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,*combOSI);
+		rcindex.setupFromForwardCompact(fastaname,tmpprefix,forwindex.fainame,forwindex.compactname,forwindex.metaname,forwindex.replname,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,*combOSI);
+
+		combOSI->flush();
+		combOSI.reset();
+
+		forwindex.cleanup();
+		rcindex.cleanup();
+
+		// rename
+		libmaus2::aio::OutputStreamFactoryContainer::rename(indexcreatefn,combfn);
+	}
+
 	DNAIndex forwindex;
-	forwindex.setupFromFasta(fastaname,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,cache_k);
 	DNAIndex rcindex;
-	rcindex.setupFromForwardCompact(fastaname,forwindex.fainame,forwindex.compactname,forwindex.metaname,forwindex.replname,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,cache_k);
+
+	libmaus2::aio::InputStreamInstance::unique_ptr_type combISI(new libmaus2::aio::InputStreamInstance(combfn));
+	forwindex.loadFromSingleForward(*combISI,numthreads,cache_k,verbose);
+	rcindex.loadFromSingleReverseComplement(*combISI,numthreads,cache_k,verbose);
+	combISI.reset();
 
 	libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(forwindex.getBamHeader());
 
@@ -2269,6 +2317,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 
 	Free_Align_Spec(aspec);
 
+
 	return EXIT_SUCCESS;
 }
 
@@ -2292,8 +2341,8 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " -i: maximum number of read bases per input block (default 64m)\n";
 	ostr << " -M: damapper memory limit\n";
 	ostr << " --sasamplingrate: SA sampling rate (default 32)\n";
-	// ostr << " --isasamplingrate : ISA sampling rate (default 32)\n";
 	ostr << " --bwtconstrmem: memory used to construct BWT (default 3/4 of machine's memory)\n";
+	ostr << " -T: prefix for temporary files used during index construction\n";
 
 	return ostr.str();
 }
