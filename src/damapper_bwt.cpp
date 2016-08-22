@@ -1042,7 +1042,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	}
 
 	std::string const fastaname = arg[0];
-	std::string const combfn = fastaname + ".damapper_bwt";
+	std::string const combfn = arg.uniqueArgPresent("Q") ? arg["Q"] : (fastaname + ".damapper_bwt");
 
 	if (
 		(! libmaus2::util::GetFileSize::fileExists(combfn))
@@ -2343,6 +2343,7 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " --sasamplingrate: SA sampling rate (default 32)\n";
 	ostr << " --bwtconstrmem: memory used to construct BWT (default 3/4 of machine's memory)\n";
 	ostr << " -T: prefix for temporary files used during index construction\n";
+	ostr << " -Q: file name of index\n";
 
 	return ostr.str();
 }
