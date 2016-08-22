@@ -1,3 +1,9 @@
+damapper-bwt (0.0.4-1) unstable; urgency=medium
+
+  * store index in a single file
+
+ -- German Tischler <tischler@mpi-cbg.de>  Mon, 22 Aug 2016 10:22:40 +0200
+
 damapper-bwt (0.0.3-1) unstable; urgency=medium
 
   * bump libmaus2 version to 2.0.245
