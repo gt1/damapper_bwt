@@ -1005,7 +1005,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	unsigned int const verbose = arg.argPresent("v") ? arg.getUnsignedNumericArg<uint64_t>("v") : defv;
 
 	// maximum number of input bases per block
-	uint64_t const defo = 64*1024*1024;
+	uint64_t const defo = 256*1024*1024;
 	uint64_t const maxo = arg.argPresent("i") ? std::max(static_cast<uint64_t>(1),arg.getUnsignedNumericArg<uint64_t>("i")) : defo;
 
 	// length for K-mer cache
@@ -1015,7 +1015,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	MEM_PHYSICAL = libmaus2::util::MemoryStatistics::getPhysicalMemory();
 	MEM_LIMIT = MEM_PHYSICAL;
 
-	uint64_t const defconstrsasamplingrate = 32;
+	uint64_t const defconstrsasamplingrate = 4;
 	uint64_t const constrsasamplingrate = arg.argPresent("sasamplingrate") ? std::max(static_cast<uint64_t>(1),arg.getUnsignedNumericArg<uint64_t>("sasamplingrate")) : defconstrsasamplingrate;
 	uint64_t const deficonstrsasamplingrate = 32;
 	uint64_t const iconstrsasamplingrate = arg.argPresent("isasamplingrate") ? std::max(static_cast<uint64_t>(1),arg.getUnsignedNumericArg<uint64_t>("isasamplingrate")) : deficonstrsasamplingrate;
