@@ -1,3 +1,9 @@
+damapper-bwt (0.0.6-1) unstable; urgency=medium
+
+  * change default parameters for SA sampling rate and input block size
+
+ -- German Tischler <tischler@mpi-cbg.de>  Wed, 21 Sep 2016 15:19:36 +0200
+
 damapper-bwt (0.0.5-1) unstable; urgency=medium
 
   * add -Q option to specify index file name
