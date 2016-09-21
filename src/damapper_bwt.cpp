@@ -2338,9 +2338,9 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " -p: no effect (compiled without support for OpenMP parallelism)\n";
 	#endif
 	ostr << " -v: verbosity level (default: 1)\n";
-	ostr << " -i: maximum number of read bases per input block (default 64m)\n";
+	ostr << " -i: maximum number of read bases per input block (default 256m)\n";
 	ostr << " -M: damapper memory limit\n";
-	ostr << " --sasamplingrate: SA sampling rate (default 32)\n";
+	ostr << " --sasamplingrate: SA sampling rate (default 4)\n";
 	ostr << " --bwtconstrmem: memory used to construct BWT (default 3/4 of machine's memory)\n";
 	ostr << " -T: prefix for temporary files used during index construction\n";
 	ostr << " -Q: file name of index\n";
