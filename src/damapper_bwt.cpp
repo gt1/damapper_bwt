@@ -2032,11 +2032,20 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			for ( uint64_t i = 1; i <= numthreads; ++i )
 			{
 				std::ostringstream fnostr;
+				#if 0
 				fnostr
 					<< Wref.A.begin()
 					<< "."
 					<< Wprefix.A.begin()
-					<< ".C" << i << ".las";
+					<< ".R" << i << ".las";
+				#else
+				fnostr
+					<< "/tmp/"
+					<< Wref.A.begin()
+					<< "."
+					<< Wprefix.A.begin()
+					<< ".R" << i << ".las";
+				#endif
 				Voutfn.push_back(fnostr.str());
 			}
 		}
