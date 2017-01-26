@@ -831,7 +831,7 @@ struct DNAIndex : public DNAIndexBase
 		refdb.ureads = PFAI->size();
 		refdb.treads = PFAI->size();
 		refdb.cutoff = -1;
-		refdb.all = 0;
+		// refdb.all = 0;
 		refdb.freq[0] = refdb.freq[1] = refdb.freq[2] = refdb.freq[3] = 0.25;
 		refdb.maxlen = refmaxlen;
 		refdb.totlen = reftotlen;
@@ -1340,7 +1340,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		readsdb.ureads = numreads;
 		readsdb.treads = numreads;
 		readsdb.cutoff = -1;
-		readsdb.all = 0;
+		// readsdb.all = 0;
 		readsdb.freq[0] = readsdb.freq[1] = readsdb.freq[2] = readsdb.freq[3] = 0.25;
 		readsdb.maxlen = readmaxlen;
 		readsdb.totlen = readtotlen;
