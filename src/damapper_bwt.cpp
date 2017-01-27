@@ -756,14 +756,81 @@ struct DNAIndex : public DNAIndexBase
 	uint64_t sasamplingmask;
 	unsigned int sashift;
 
-	libmaus2::bambam::BamHeader::unique_ptr_type getBamHeader()
+	static std::string getCurrentDir()
 	{
+		uint64_t size = PATH_MAX;
+		while ( true )
+		{
+			libmaus2::autoarray::AutoArray<char> A(size,false);
+
+			char * c = ::getcwd(A.begin(),A.size());
+
+			if ( ! c )
+			{
+				int const error = errno;
+
+				switch ( error )
+				{
+					case ERANGE:
+						size *= 2;
+						break;
+					default:
+					{
+						libmaus2::exception::LibMausException lme;
+						lme.getStream() << "getcwd() failed with error " << strerror(errno) << std::endl;
+						lme.finish();
+						throw lme;
+					}
+				}
+			}
+			else
+			{
+				return std::string(c);
+			}
+		}
+	}
+
+	static bool startsWithAlphaColon(std::string const & url)
+	{
+		uint64_t col = url.size();
+		for ( uint64_t i = 0; i < url.size() && col == url.size(); ++i )
+			if ( url[i] == ':' )
+				col = i;
+
+		if ( col == url.size() )
+			return false;
+
+		for ( uint64_t i = 0; i < col; ++i )
+			if ( !isalpha(static_cast<unsigned char >(url[i])) )
+				return false;
+
+		return true;
+	}
+
+	libmaus2::bambam::BamHeader::unique_ptr_type getBamHeader(std::map<std::string,std::string> const & m5map, std::string const & refurl)
+	{
+		std::string storeurl;
+
+		if ( startsWithAlphaColon(refurl) )
+			storeurl = refurl;
+		else if (refurl.size() && refurl[0] == '/')
+			storeurl = std::string("file:") + refurl;
+		else
+			storeurl = std::string("file:") + getCurrentDir() + "/" + refurl;
+
 		std::ostringstream samheaderstr;
 		samheaderstr << "@HD\tVN:1.5\tSO:unknown\n";
 		for ( uint64_t i = 0; i < PFAI->size(); ++i )
 		{
 			libmaus2::fastx::FastAIndexEntry const & entry = (*PFAI)[i];
-			samheaderstr << "@SQ\tSN:" << entry.name << "\tLN:" << entry.length << "\n";
+			samheaderstr << "@SQ\tSN:" << entry.name << "\tLN:" << entry.length;
+
+			if ( m5map.find(entry.name) != m5map.end() )
+				samheaderstr << "\tM5:" << m5map.find(entry.name)->second;
+
+			samheaderstr << "\tUR:" << storeurl;
+
+			samheaderstr << "\n";
 		}
 		// std::cerr << samheaderstr.str();
 		libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(new libmaus2::bambam::BamHeader(samheaderstr.str()));
@@ -1029,6 +1096,30 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	uint64_t const numthreads = 1;
 	#endif
 
+	std::string const s_supstrat = arg.uniqueArgPresent("S") ? arg["S"] : "none";
+
+	libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_t e_supstrat;
+
+	if ( s_supstrat == "none" )
+	{
+		e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_none;
+	}
+	else if ( s_supstrat == "soft" )
+	{
+		e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_soft;
+	}
+	else if ( s_supstrat == "hard" )
+	{
+		e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_hard;
+	}
+	else
+	{
+		libmaus2::exception::LibMausException lme;
+		lme.getStream() << "[E] unknown storage strategy " << s_supstrat << std::endl;
+		lme.finish();
+		throw lme;
+	}
+
 	uint64_t const defmemlimit = 0;
 	uint64_t const memlimit = arg.uniqueArgPresent("M") ? arg.getUnsignedNumericArg<uint64_t>("M") : defmemlimit;
 	if ( memlimit )
@@ -1061,6 +1152,18 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		forwindex.setupFromFasta(fastaname,tmpprefix,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,*combOSI);
 		rcindex.setupFromForwardCompact(fastaname,tmpprefix,forwindex.fainame,forwindex.compactname,forwindex.metaname,forwindex.replname,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,*combOSI);
 
+		std::string const m5info = tmpprefix+".m5infos";
+		libmaus2::aio::InputStreamInstance ISI(fastaname);
+		libmaus2::fastx::FastAStreamSet FASS(ISI);
+		std::map<std::string,std::string> m5map = FASS.computeMD5(false,false);
+
+		libmaus2::util::NumberSerialisation::serialiseNumber(*combOSI,m5map.size());
+		for ( std::map<std::string,std::string>::const_iterator ita = m5map.begin(); ita != m5map.end(); ++ita )
+		{
+			libmaus2::util::StringSerialisation::serialiseString(*combOSI,ita->first);
+			libmaus2::util::StringSerialisation::serialiseString(*combOSI,ita->second);
+		}
+
 		combOSI->flush();
 		combOSI.reset();
 
@@ -1077,9 +1180,19 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	libmaus2::aio::InputStreamInstance::unique_ptr_type combISI(new libmaus2::aio::InputStreamInstance(combfn));
 	forwindex.loadFromSingleForward(*combISI,numthreads,cache_k,verbose);
 	rcindex.loadFromSingleReverseComplement(*combISI,numthreads,cache_k,verbose);
+
+	std::map<std::string,std::string> m5map;
+	uint64_t const sm5 = libmaus2::util::NumberSerialisation::deserialiseNumber(*combISI);
+	for ( uint64_t i = 0; i < sm5; ++i )
+	{
+		std::string const key = libmaus2::util::StringSerialisation::deserialiseString(*combISI);
+		std::string const value = libmaus2::util::StringSerialisation::deserialiseString(*combISI);
+		m5map[key] = value;
+	}
+
 	combISI.reset();
 
-	libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(forwindex.getBamHeader());
+	libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(forwindex.getBamHeader(m5map,fastaname));
 
 	std::vector < DNAIndex * > indexes;
 	indexes.push_back(&forwindex);
@@ -1256,7 +1369,10 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		refmap.push_back(libmaus2::dazzler::align::RefMapEntry(i,0));
 	for ( uint64_t i = 0; i < numthreads; ++i )
 	{
-		LASToBamContext::unique_ptr_type Tptr(new LASToBamContext(tspace,true /* mdnm */,libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_none,std::string(),refmap));
+		LASToBamContext::unique_ptr_type Tptr(new LASToBamContext(
+			tspace,true /* mdnm */,
+			e_supstrat,
+			std::string(),refmap));
 		Acontexts[i] = UNIQUE_PTR_MOVE(Tptr);
 	}
 
@@ -2353,6 +2469,7 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " --bwtconstrmem: memory used to construct BWT (default 3/4 of machine's memory)\n";
 	ostr << " -T: prefix for temporary files used during index construction\n";
 	ostr << " -Q: file name of index\n";
+	ostr << " -S: storage strategy for non primary alignments (none, soft, hard)\n";
 
 	return ostr.str();
 }

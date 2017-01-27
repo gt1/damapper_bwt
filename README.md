@@ -49,8 +49,9 @@ The following parameters can be used (no space allowed between option an argumen
 * -M: damapper memory limit
 * --sasamplingrate: SA sampling rate (default 32)
 * --bwtconstrmem: memory used to construct BWT (default 3/4 of machine's memory)
-* --T: prefix for temporary files during index construction
-* --Q: index file name (defaults to .damapper_bwt appended to reference file name)
+* -T: prefix for temporary files during index construction
+* -Q: index file name (defaults to .damapper_bwt appended to reference file name)
+* -S: sequence storage strategy for non primary alignments (none, soft, hard)
 
 BAM output files
 ----------------
