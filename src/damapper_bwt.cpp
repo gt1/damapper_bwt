@@ -70,6 +70,11 @@
 #include <libmaus2/fastx/StreamFastAReader.hpp>
 #include <libmaus2/util/MemoryStatistics.hpp>
 #include <libmaus2/fastx/FastAIndexGenerator.hpp>
+#include <libmaus2/parallel/PosixSemaphore.hpp>
+#include <libmaus2/parallel/SimpleThreadWorkPackage.hpp>
+#include <libmaus2/parallel/SimpleThreadWorkPackageDispatcher.hpp>
+#include <libmaus2/parallel/SimpleThreadPool.hpp>
+#include <libmaus2/util/Demangle.hpp>
 
 // damapper interface
 
@@ -1060,9 +1065,1073 @@ struct ReadInterval
 	}
 };
 
+struct RefKMer
+{
+	uint64_t code;
+	uint64_t low;
+	uint64_t high;
+};
+
+struct RefKMerCodeComparator
+{
+	bool operator()(RefKMer const & A, RefKMer const & B) const
+	{
+		return A.code < B.code;
+	}
+};
+
+struct QueryKMer
+{
+	uint64_t code;
+	uint32_t rpos;
+	uint32_t readid;
+
+	bool operator<(QueryKMer const & O) const
+	{
+		if ( code != O.code )
+			return code < O.code;
+		else if ( readid != O.readid )
+			return readid < O.readid;
+		else
+			return rpos < O.rpos;
+	}
+};
+
+struct PackageSearchKmers
+{
+	uint64_t t; /* thread id */
+	uint64_t readsperpack;
+	uint64_t numreads;
+	unsigned int k;
+	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < RefKMer >::unique_ptr_type > * RKM;
+	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < QueryKMer >::unique_ptr_type > * QKM;
+	libmaus2::autoarray::AutoArray<char> const * Areaddata;
+	libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > const * O;
+	libmaus2::autoarray::AutoArray< uint64_t > * NUMRK;
+	libmaus2::autoarray::AutoArray< uint64_t > * NUMQK;
+	DNAIndex * index;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageSearchKmers() {}
+
+	PackageSearchKmers(
+		uint64_t const rt, /* thread id */
+		uint64_t const rreadsperpack,
+		uint64_t const rnumreads,
+		unsigned int const rk,
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < RefKMer >::unique_ptr_type > * rRKM,
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < QueryKMer >::unique_ptr_type > * rQKM,
+		libmaus2::autoarray::AutoArray<char> const * rAreaddata,
+		libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > const * rO,
+		libmaus2::autoarray::AutoArray< uint64_t > * rNUMRK,
+		libmaus2::autoarray::AutoArray< uint64_t > * rNUMQK,
+		DNAIndex * rindex,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	)
+	: t(rt), readsperpack(rreadsperpack), numreads(rnumreads), k(rk), RKM(rRKM), QKM(rQKM), Areaddata(rAreaddata), O(rO), NUMRK(rNUMRK), NUMQK(rNUMQK), index(rindex), finsem(rfinsem)
+	{
+
+	}
+};
+
+static void threadSearchKmers(PackageSearchKmers package)
+{
+	uint64_t const low = package.t * package.readsperpack;
+	uint64_t const high = std::min(low+package.readsperpack,package.numreads);
+	libmaus2::autoarray::AutoArray < RefKMer > & LRKM = *(*(package.RKM))[package.t];
+	libmaus2::autoarray::AutoArray < QueryKMer > & LQKM = *(*(package.QKM))[package.t];
+
+	uint64_t rkmo = 0;
+	uint64_t qkmo = 0;
+
+	uint64_t const kmask = libmaus2::math::lowbits(2*package.k);
+
+	for ( uint64_t zz = low; zz < high; ++zz )
+	{
+		//char const * const cmapped = Areaddata.begin() + O[zz].dataoff;
+		char const * const cmapped = package.Areaddata->begin() + (*(package.O))[zz].dataoff;
+		uint64_t const m = (*(package.O))[zz].len;
+
+		uint64_t const numk = (m >= package.k) ? m-package.k+1 : 0;
+
+		if ( numk && package.k )
+		{
+			uint64_t v = 0;
+			uint64_t e = 0;
+			char const * c = cmapped;
+
+			for ( uint64_t i = 0; i < package.k-1; ++i )
+			{
+				v <<= 2;
+				uint64_t const s = *(c++);
+				v |= s & 3;
+				e += (s>>2)&1;
+			}
+			char const * b = cmapped;
+
+			for ( uint64_t ik = 0; ik < numk; ++ik )
+			{
+				v <<= 2;
+				v &= kmask;
+				uint64_t const s = *(c++);
+				v |= s & 3;
+				e += (s >> 2)&1;
+
+				if ( ! e )
+				{
+					std::pair<uint64_t,uint64_t> const P = package.index->PKcache->search(c-package.k,package.k);
+
+					if ( P.second != P.first )
+					{
+						RefKMer K;
+						K.code = v;
+						K.low = P.first;
+						K.high = P.second;
+						LRKM.push(rkmo,K);
+
+						assert ( (K.code & kmask) == K.code );
+
+						QueryKMer Q;
+						Q.code = v;
+						Q.rpos = ik;
+						Q.readid = zz;
+						LQKM.push(qkmo,Q);
+					}
+				}
+
+				uint64_t sa = *(b++);
+				e -= (sa >> 2)&1;
+			}
+		}
+	}
+
+	// sort reference kmers
+	std::sort(LRKM.begin(),LRKM.begin() + rkmo,RefKMerCodeComparator());
+	uint64_t l = 0;
+	uint64_t o = 0;
+	// uniquify
+	while ( l < rkmo )
+	{
+		uint64_t h = l+1;
+		while ( h < rkmo && LRKM[h].code == LRKM[l].code )
+			++h;
+		LRKM[o++] = LRKM[l];
+		l = h;
+	}
+	rkmo = o;
+
+	(*(package.NUMRK))[package.t] = rkmo;
+	(*(package.NUMQK))[package.t] = qkmo;
+
+	package.finsem->post();
+}
+
+struct PackageConcatSA
+{
+	uint64_t t;
+	libmaus2::autoarray::AutoArray < RefKMer > * GRKM;
+	libmaus2::autoarray::AutoArray< uint64_t > * NUMRK;
+	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < RefKMer >::unique_ptr_type > * RKM;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageConcatSA() {}
+
+	PackageConcatSA(uint64_t const rt,
+		libmaus2::autoarray::AutoArray < RefKMer > * rGRKM,
+		libmaus2::autoarray::AutoArray< uint64_t > * rNUMRK,
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < RefKMer >::unique_ptr_type > * rRKM,
+		libmaus2::parallel::PosixSemaphore *rfinsem)
+	: t(rt), GRKM(rGRKM), NUMRK(rNUMRK), RKM(rRKM), finsem(rfinsem) {}
+
+};
+
+static void threadConcatSA(PackageConcatSA package)
+{
+	RefKMer * O = (package.GRKM)->begin() + (*(package.NUMRK))[(package.t)];
+	RefKMer * Oe = (package.GRKM)->begin() + (*(package.NUMRK))[(package.t)+1];
+	RefKMer * I = (*(package.RKM))[(package.t)]->begin();
+
+	while ( O != Oe )
+		*(O++) = *(I++);
+
+	(*(package.RKM))[(package.t)]->resize(0);
+
+	package.finsem->post();
+}
+
+struct PackageFillHist
+{
+	uint64_t t;
+	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> * Ahist;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageFillHist() {}
+
+	PackageFillHist(
+		uint64_t const rt,
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> * rAhist,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), Ahist(rAhist), finsem(rfinsem) {}
+};
+
+static void threadFillHist(PackageFillHist package)
+{
+	std::fill((*(package.Ahist))[(package.t)]->begin(),(*(package.Ahist))[(package.t)]->end(),0ull);
+	package.finsem->post();
+}
+
+struct PackageUnifyPackageSizes
+{
+	uint64_t t;
+	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> * Ahist;
+	libmaus2::autoarray::AutoArray < RefKMer > * GRKM;
+	std::vector<uint64_t> * ubounds;
+	std::vector<uint64_t> * usize;
+	uint64_t histthres;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageUnifyPackageSizes() {}
+
+	PackageUnifyPackageSizes(
+		uint64_t const rt,
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> * rAhist,
+		libmaus2::autoarray::AutoArray < RefKMer > * rGRKM,
+		std::vector<uint64_t> * rubounds,
+		std::vector<uint64_t> * rusize,
+		uint64_t const rhistthres,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), Ahist(rAhist), GRKM(rGRKM), ubounds(rubounds), usize(rusize), histthres(rhistthres), finsem(rfinsem) {}
+};
+
+static void threadUnifyPackageSizes(PackageUnifyPackageSizes package)
+{
+	libmaus2::autoarray::AutoArray<uint64_t> & thist = *((*(package.Ahist))[(package.t)-1].get());
+
+	// lower bound
+	uint64_t ulow = (*(package.ubounds))[(package.t)-1];
+	// upper bound
+	uint64_t const utop = (*(package.ubounds))[(package.t)];
+
+	// output pointer
+	uint64_t uout = ulow;
+	while ( ulow < utop )
+	{
+		// go to end of code
+		uint64_t uhigh = ulow+1;
+		while ( uhigh < utop && (*(package.GRKM))[uhigh].code == (*(package.GRKM))[ulow].code )
+			++uhigh;
+
+		// single output
+		(*(package.GRKM))[uout++] = (*(package.GRKM))[ulow];
+
+		uint64_t const s = (*(package.GRKM))[ulow].high-(*(package.GRKM))[ulow].low;
+		if ( s < (package.histthres) )
+			thist [ s ] += 1;
+		else
+			thist [ (package.histthres) ] += s;
+
+		ulow = uhigh;
+	}
+
+	// size of package
+	(*(package.usize))[(package.t)-1] = uout - (*(package.ubounds))[(package.t)-1];
+
+	package.finsem->post();
+}
+
+struct PackageMergeHistograms
+{
+	uint64_t t;
+	uint64_t tperthread;
+	uint64_t histmult;
+	uint64_t numthreads;
+	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> * Ahist;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageMergeHistograms() {}
+
+	PackageMergeHistograms(
+		uint64_t const rt,
+		uint64_t const rtperthread,
+		uint64_t const rhistmult,
+		uint64_t const rnumthreads,
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> * rAhist,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), tperthread(rtperthread), histmult(rhistmult), numthreads(rnumthreads), Ahist(rAhist), finsem(rfinsem)
+	{}
+};
+
+static void threadMergeHistograms(PackageMergeHistograms package)
+{
+	uint64_t const tlow = package.t * package.tperthread;
+	uint64_t const thigh = std::min ( tlow + package.tperthread, package.histmult );
+
+	uint64_t * const T = (*(package.Ahist))[0]->begin();
+
+	for ( uint64_t j = 1; j < package.numthreads; ++j )
+	{
+		uint64_t * const S = (*(package.Ahist))[j]->begin();
+
+		for ( uint64_t i = tlow; i < thigh; ++i )
+			T[i] += S[i];
+	}
+
+	package.finsem->post();
+}
+
+struct PackageConcatenateUnique
+{
+	uint64_t t;
+	libmaus2::autoarray::AutoArray < RefKMer > * GRKM;
+	libmaus2::autoarray::AutoArray < RefKMer > * TGRKM;
+	std::vector<uint64_t> * ubounds;
+	std::vector<uint64_t> * usize;
+	libmaus2::parallel::PosixSpinLock * gclock;
+	uint64_t volatile * gc;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageConcatenateUnique() {}
+	PackageConcatenateUnique(
+		uint64_t const rt,
+		libmaus2::autoarray::AutoArray < RefKMer > * rGRKM,
+		libmaus2::autoarray::AutoArray < RefKMer > * rTGRKM,
+		std::vector<uint64_t> * rubounds,
+		std::vector<uint64_t> * rusize,
+		libmaus2::parallel::PosixSpinLock * rgclock,
+		uint64_t volatile * rgc,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), GRKM(rGRKM), TGRKM(rTGRKM), ubounds(rubounds), usize(rusize), gclock(rgclock), gc(rgc), finsem(rfinsem) {}
+};
+
+static void threadConcatenateUnique(
+	PackageConcatenateUnique package
+	#if 0
+	uint64_t const t,
+	libmaus2::autoarray::AutoArray < RefKMer > * GRKM,
+	libmaus2::autoarray::AutoArray < RefKMer > * TGRKM,
+	std::vector<uint64_t> * ubounds,
+	std::vector<uint64_t> * usize,
+	libmaus2::parallel::PosixSpinLock * gclock,
+	uint64_t volatile * gc,
+	libmaus2::parallel::PosixSemaphore *finsem
+	#endif
+)
+{
+	RefKMer * I = (package.GRKM)->begin() + (*(package.ubounds))[(package.t)-1];
+	RefKMer * O = (package.TGRKM)->begin() + (*(package.usize))[(package.t)-1];
+	RefKMer * Oe = (package.TGRKM)->begin() + (*(package.usize))[(package.t)];
+
+	uint64_t c = 0;
+	while ( O != Oe )
+	{
+		c += I->high-I->low;
+		*(O++) = *(I++);
+	}
+	package.gclock->lock();
+	(*(package.gc)) += c;
+	package.gclock->unlock();
+
+	#if 0
+	uint64_t cc = 0;
+	for ( RefKMer * C = TGRKM.begin() + (package.usize)[t-1]; C != TGRKM.begin() + (package.usize)[t]; ++C )
+		cc += C->high-C->low;
+	assert ( cc == c );
+	#endif
+
+	package.finsem->post();
+}
+
+struct PackageSumIntervals
+{
+	uint64_t t;
+	uint64_t supacksize;
+	std::vector<uint64_t> * usize;
+	libmaus2::autoarray::AutoArray < RefKMer > * GRKM;
+	libmaus2::autoarray::AutoArray<uint64_t,libmaus2::autoarray::alloc_type_c> * PP;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageSumIntervals() {}
+	PackageSumIntervals(
+		uint64_t const rt,
+		uint64_t const rsupacksize,
+		std::vector<uint64_t> * rusize,
+		libmaus2::autoarray::AutoArray < RefKMer > * rGRKM,
+		libmaus2::autoarray::AutoArray<uint64_t,libmaus2::autoarray::alloc_type_c> * rPP,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), supacksize(rsupacksize), usize(rusize), GRKM(rGRKM), PP(rPP), finsem(rfinsem)
+	{
+
+	}
+};
+
+static void threadSumIntervals(
+	PackageSumIntervals package
+	#if 0
+	uint64_t const t,
+	uint64_t const supacksize,
+	std::vector<uint64_t> * usize,
+	libmaus2::autoarray::AutoArray < RefKMer > * GRKM,
+	libmaus2::autoarray::AutoArray<uint64_t,libmaus2::autoarray::alloc_type_c> * PP,
+	libmaus2::parallel::PosixSemaphore *finsem
+	#endif
+)
+{
+	uint64_t const ulow = package.t * package.supacksize;
+	uint64_t const uhigh = std::min(ulow+package.supacksize,package.usize->back());
+	assert ( uhigh != ulow );
+
+	RefKMer * I  = package.GRKM->begin() + ulow;
+	RefKMer * Ie = package.GRKM->begin() + uhigh;
+
+	uint64_t s = 0;
+	for ( ; I != Ie ; ++I )
+		s += I->high-I->low;
+	(*(package.PP))[uhigh] = s;
+
+	package.finsem->post();
+}
+
+struct PackagePrefixSums
+{
+	uint64_t t;
+	uint64_t supacksize;
+	std::vector<uint64_t> * usize;
+	libmaus2::autoarray::AutoArray < RefKMer > * GRKM;
+	libmaus2::autoarray::AutoArray<uint64_t,libmaus2::autoarray::alloc_type_c> * PP;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackagePrefixSums() {}
+
+	PackagePrefixSums(
+		uint64_t const rt,
+		uint64_t const rsupacksize,
+		std::vector<uint64_t> * rusize,
+		libmaus2::autoarray::AutoArray < RefKMer > * rGRKM,
+		libmaus2::autoarray::AutoArray<uint64_t,libmaus2::autoarray::alloc_type_c> * rPP,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), supacksize(rsupacksize), usize(rusize), GRKM(rGRKM), PP(rPP), finsem(rfinsem)
+	{
+
+	}
+};
+
+static void threadPrefixSums(PackagePrefixSums package)
+{
+	uint64_t const ulow = package.t * package.supacksize;
+	uint64_t const uhigh = std::min(ulow+package.supacksize,package.usize->back());
+	assert ( uhigh != ulow );
+
+	RefKMer * I  = package.GRKM->begin() + ulow;
+	RefKMer * Ie = package.GRKM->begin() + uhigh;
+
+	uint64_t * p = package.PP->begin() + ulow;
+
+	uint64_t s = *p;
+	for ( ; I != Ie ; ++I )
+	{
+		*(p++) = s;
+		s += (I->high-I->low);
+	}
+
+	package.finsem->post();
+}
+
+struct PackageLookupSA
+{
+	uint64_t t;
+	unsigned int k;
+	libmaus2::autoarray::AutoArray < RefKMer > * GRKM;
+	libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > * GRQKM;
+	std::vector<uint64_t> * uranges;
+	std::vector<uint64_t> * urefk;
+	std::vector<uint64_t> * NUMREFKVALID;
+	DNAIndex * index;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageLookupSA() {}
+
+	PackageLookupSA(
+		uint64_t const rt,
+		unsigned int const rk,
+		libmaus2::autoarray::AutoArray < RefKMer > * rGRKM,
+		libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > * rGRQKM,
+		std::vector<uint64_t> * ruranges,
+		std::vector<uint64_t> * rurefk,
+		std::vector<uint64_t> * rNUMREFKVALID,
+		DNAIndex * rindex,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), k(rk), GRKM(rGRKM), GRQKM(rGRQKM), uranges(ruranges), urefk(rurefk), NUMREFKVALID(rNUMREFKVALID), index(rindex), finsem(rfinsem)
+	{}
+
+};
+
+static void threadLookupSA(PackageLookupSA package)
+{
+	RefKMer * I  = package.GRKM->begin() + (*(package.uranges))[package.t-1];
+	RefKMer * Ie = package.GRKM->begin() + (*(package.uranges))[package.t];
+	QueryKMer * O = package.GRQKM->begin() + (*(package.urefk))[package.t-1];
+	QueryKMer Q;
+	uint64_t numvalid = 0;
+	uint64_t c = 0;
+
+	for ( ; I != Ie; ++I )
+	{
+		RefKMer const & R = *I;
+		c += R.high-R.low;
+		Q.code = R.code;
+
+		for ( uint64_t jr = R.low; jr < R.high; ++jr )
+		{
+			uint64_t const p = package.index->lookupSA(jr);
+			std::pair<uint64_t,uint64_t> coord = (*(package.index->PCC))[p]; // Pindex->mapCoordinates((*SSA)[jr]);
+			if ( package.index->Pindex->valid(coord,package.k) )
+			{
+				Q.rpos = coord.second;
+				Q.readid = coord.first;
+				*(O++) = Q;
+				numvalid += 1;
+			}
+			#if 0
+			else
+			{
+				Q.code = std::numeric_limits<uint64_t>::max();
+				Q.rpos = 0;
+				Q.readid = 0;
+				*(O++) = Q;
+			}
+			#endif
+		}
+	}
+	assert ( c == (*(package.urefk))[package.t]-(*(package.urefk))[package.t-1] );
+	// assert ( O == GRQKM.begin() + NUMREFK[t] );
+	(*(package.NUMREFKVALID))[package.t-1] = numvalid;
+
+	package.finsem->post();
+}
+
+struct PackageCompactPos
+{
+	uint64_t t;
+	libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > * GRQKM;
+	libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > * TGRQKM;
+	std::vector<uint64_t> * NUMREFKVALID;
+	std::vector<uint64_t> * urefk;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageCompactPos() {}
+	PackageCompactPos(
+		uint64_t const rt,
+		libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > * rGRQKM,
+		libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > * rTGRQKM,
+		std::vector<uint64_t> * rNUMREFKVALID,
+		std::vector<uint64_t> * rurefk,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), GRQKM(rGRQKM), TGRQKM(rTGRQKM), NUMREFKVALID(rNUMREFKVALID), urefk(rurefk), finsem(rfinsem)
+	{}
+};
+
+static void threadCompactPos(PackageCompactPos package)
+{
+	QueryKMer * I = package.GRQKM->begin() + (*(package.urefk))[package.t-1];
+	QueryKMer * O = package.TGRQKM->begin() + (*(package.NUMREFKVALID))[package.t-1];
+	QueryKMer * Oe = package.TGRQKM->begin() + (*(package.NUMREFKVALID))[package.t];
+
+	while ( O != Oe )
+		*(O++) = *(I++);
+
+	package.finsem->post();
+}
+
+struct PackageConcatQueryKmers
+{
+	uint64_t t;
+	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < QueryKMer >::unique_ptr_type > * QKM;
+	libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > * GQKM;
+	libmaus2::autoarray::AutoArray< uint64_t > * NUMQK;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageConcatQueryKmers() {}
+	PackageConcatQueryKmers(
+		uint64_t const rt,
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < QueryKMer >::unique_ptr_type > * rQKM,
+		libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > * rGQKM,
+		libmaus2::autoarray::AutoArray< uint64_t > * rNUMQK,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), QKM(rQKM), GQKM(rGQKM), NUMQK(rNUMQK), finsem(rfinsem)
+	{}
+};
+
+static void threadConcatQueryKmers(PackageConcatQueryKmers package)
+{
+	libmaus2::autoarray::AutoArray < QueryKMer > & LQKM = *(*(package.QKM))[package.t];
+
+	QueryKMer const * I = LQKM.begin();
+	QueryKMer * O = package.GQKM->begin() + (*(package.NUMQK))[package.t];
+	QueryKMer * Oe = package.GQKM->begin() + (*(package.NUMQK))[package.t+1];
+
+	while ( O != Oe )
+		*(O++) = *(I++);
+
+	(*(package.QKM))[package.t]->resize(0);
+
+	package.finsem->post();
+}
+
+struct LASToBamContext
+{
+	typedef LASToBamContext this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+
+	libmaus2::dazzler::align::LASToBamConverterBase converter;
+	libmaus2::bambam::parallel::FragmentAlignmentBufferFragment fragment;
+	libmaus2::autoarray::AutoArray<char> ARC;
+
+	LASToBamContext(
+		int64_t const rtspace,
+		bool const rcalmdnm,
+		libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_t rseqstrat,
+		std::string const & rrgid,
+		libmaus2::dazzler::align::RefMapEntryVector const & refmap
+	) : converter(rtspace,rcalmdnm,rseqstrat,rrgid,refmap), fragment(), ARC()
+	{
+
+	}
+};
+
+struct PackageEncodeBam
+{
+	uint64_t zr;
+	std::vector<uint64_t> const * ointv;
+	libmaus2::autoarray::AutoArray<LASToBamContext::unique_ptr_type> * Acontexts;
+	libmaus2::dazzler::align::OverlapData const * OVLdata;
+	int64_t prevmark;
+	libmaus2::autoarray::AutoArray<char> const * Areadnames;
+	libmaus2::bambam::BamHeader::unique_ptr_type * Pbamheader;
+	libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > const * O;
+	HITS_DB * refdb;
+	HITS_DB * readsdb;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageEncodeBam() {}
+
+	PackageEncodeBam(
+		uint64_t const rzr,
+		std::vector<uint64_t> const * rointv,
+		libmaus2::autoarray::AutoArray<LASToBamContext::unique_ptr_type> * rAcontexts,
+		libmaus2::dazzler::align::OverlapData const * rOVLdata,
+		int64_t const rprevmark,
+		libmaus2::autoarray::AutoArray<char> const * rAreadnames,
+		libmaus2::bambam::BamHeader::unique_ptr_type * rPbamheader,
+		libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > const * rO,
+		HITS_DB * rrefdb,
+		HITS_DB * rreadsdb,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : zr(rzr), ointv(rointv), Acontexts(rAcontexts), OVLdata(rOVLdata), prevmark(rprevmark), Areadnames(rAreadnames),
+	    Pbamheader(rPbamheader), O(rO), refdb(rrefdb), readsdb(rreadsdb), finsem(rfinsem)
+	{
+
+	}
+};
+
+static void threadEncodeBam(PackageEncodeBam package)
+{
+	uint64_t tid = package.zr-1;
+	uint64_t const rlow = (*(package.ointv))[package.zr-1];
+	uint64_t const rhigh = (*(package.ointv))[package.zr];
+	LASToBamContext & context = *((*(package.Acontexts))[tid]);
+	context.fragment.reset();
+
+	// last read id for previous block
+	int64_t const prevb = rlow ? static_cast<int64_t>(libmaus2::dazzler::align::OverlapData::getBRead((package.OVLdata)->getData(rlow-1).first)) : package.prevmark;
+	// next expected read
+	int64_t nextexpt = prevb+1;
+
+	//std::cerr << "tid " << tid << " " << nextexpt << std::endl;
+
+	// process in batches of equal b read id
+	uint64_t ilow = rlow;
+	while ( ilow < rhigh )
+	{
+		uint64_t ihigh = ilow+1;
+		int64_t const refbread = libmaus2::dazzler::align::OverlapData::getBRead((package.OVLdata)->getData(ilow).first);
+		while ( ihigh < rhigh && libmaus2::dazzler::align::OverlapData::getBRead((package.OVLdata)->getData(ihigh).first) == refbread )
+			++ihigh;
+
+		while ( nextexpt < refbread )
+		{
+			char const * rname = (package.Areadnames)->begin() + (*(package.O))[nextexpt].nameoff;
+			char const * rdata = reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[nextexpt].boff;
+			uint64_t const readlen = (package.readsdb)->reads[nextexpt].rlen;
+			assert ( rdata[-1] == 4 );
+			assert ( rdata[readlen] == 4 );
+
+			context.converter.convertUnmapped(rdata,readlen,rname,context.fragment,**(package.Pbamheader));
+
+			// std::cerr << "[D] read " << nextexpt << " " << rname << " was not aligned" << " ref " << refbread << std::endl;
+
+			++nextexpt;
+		}
+
+		assert ( nextexpt == refbread );
+
+		uint64_t numchains = 0;
+		for ( uint64_t z = ilow; z < ihigh; ++z )
+		{
+			std::pair<uint8_t const *, uint8_t const *> const P = (package.OVLdata)->getData(z);
+			bool const isStart = libmaus2::dazzler::align::OverlapData::getStartFlag(P.first);
+			if ( isStart )
+				numchains++;
+		}
+
+		uint64_t il = ilow;
+		uint64_t chainid = 0;
+		while ( il < ihigh )
+		{
+			uint64_t ih = il+1;
+			while (
+				ih < ihigh
+				&&
+				(!libmaus2::dazzler::align::OverlapData::getStartFlag((package.OVLdata)->getData(ih).first))
+			)
+				++ih;
+
+			uint64_t const lchainid = chainid++;
+			bool const secondary = (lchainid > 0);
+
+			for ( uint64_t z = il; z < ih; ++z )
+			{
+				std::pair<uint8_t const *, uint8_t const *> const P = (package.OVLdata)->getData(z);
+
+				int64_t const aread = libmaus2::dazzler::align::OverlapData::getARead(P.first);
+				int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead(P.first);
+				int64_t const flags = libmaus2::dazzler::align::OverlapData::getFlags(P.first);
+				bool const inverse = libmaus2::dazzler::align::OverlapData::getInverseFlag(P.first);
+
+				bool const supplementary = (z != il);
+
+				// bool const primary = libmaus2::dazzler::align::OverlapData::getPrimaryFlag(P.first);
+				uint64_t const readlen = (package.readsdb)->reads[bread].rlen;
+
+				if ( z==ilow )
+				{
+					// compute reverse complement
+					context.ARC.ensureSize(readlen + 2);
+
+					char * const ra = context.ARC.begin();
+					char * rp = ra + readlen + 2;
+					char const * src = reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff - 1;
+
+					*(--rp)	= (*(src++));
+					while ( rp != ra+1 )
+						*(--rp)	= (*(src++)) ^ 3;
+					*(--rp)	= (*(src++));
+				}
+
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_i("ci",lchainid);
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_n("cn",numchains);
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_j("cj",z-il);
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_l("cl",ih-il);
+
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * reqs[] =
+				{
+					&req_i,
+					&req_n,
+					&req_j,
+					&req_l
+				};
+
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &reqs[0];
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &reqs[sizeof(reqs)/sizeof(reqs[0])];
+
+				try
+				{
+					if ( ! inverse )
+					{
+						context.converter.convert(
+							P.first,
+							reinterpret_cast<char const *>((package.refdb)->bases) + (package.refdb)->reads[aread].boff,
+							(package.refdb)->reads[aread].rlen,
+							reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff,
+							(package.readsdb)->reads[bread].rlen,
+							(package.Areadnames)->begin() + (*(package.O))[bread].nameoff,
+							context.fragment,
+							secondary,
+							supplementary,
+							**(package.Pbamheader),
+							aux_a,
+							aux_e
+						);
+					}
+					else
+					{
+						context.converter.convert(
+							P.first,
+							reinterpret_cast<char const *>((package.refdb)->bases) + (package.refdb)->reads[aread].boff,
+							(package.refdb)->reads[aread].rlen,
+							context.ARC.begin()+1 /* skip terminator */,
+							readlen,
+							(package.Areadnames)->begin() + (*(package.O))[bread].nameoff,
+							context.fragment,
+							secondary,
+							supplementary,
+							**(package.Pbamheader),
+							aux_a,
+							aux_e
+						);
+					}
+				}
+				catch(std::exception const & ex)
+				{
+					std::cerr << ex.what() << std::endl;
+					std::cerr
+						<< aread << " "
+						<< bread << " "
+						<< flags
+						<< std::endl;
+				}
+			}
+
+
+			il = ih;
+		}
+
+		nextexpt += 1;
+
+		ilow = ihigh;
+	}
+
+	package.finsem->post();
+}
+
+
+static void semWait(libmaus2::parallel::PosixSemaphore & finsem, uint64_t const t)
+{
+	for ( uint64_t i = 0; i < t; ++i )
+		finsem.wait();
+}
+
+template<typename _package_type>
+struct GenericWorkPackage : public libmaus2::parallel::SimpleThreadWorkPackage
+{
+	typedef _package_type package_type;
+	typedef GenericWorkPackage<package_type> this_type;
+	typedef typename libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef typename libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	package_type package;
+	std::string packagename;
+
+	static std::string getPackageNameStatic()
+	{
+		return libmaus2::util::Demangle::demangle<this_type>();
+	}
+
+	GenericWorkPackage() : libmaus2::parallel::SimpleThreadWorkPackage(), package(), packagename(getPackageNameStatic()) {}
+	GenericWorkPackage(
+		uint64_t const priority,
+		uint64_t const dispatcherid,
+		package_type const & rpackage
+	) : libmaus2::parallel::SimpleThreadWorkPackage(priority,dispatcherid), package(rpackage), packagename(getPackageNameStatic())
+	{}
+
+	char const * getPackageName() const
+	{
+		return packagename.c_str();
+	}
+};
+
+struct SearchKmersDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef SearchKmersDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageSearchKmers> * RP = dynamic_cast< GenericWorkPackage<PackageSearchKmers> * >(P);
+		assert ( RP );
+
+		threadSearchKmers(RP->package);
+	}
+};
+
+struct ConcatSADispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef ConcatSADispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageConcatSA> * RP = dynamic_cast< GenericWorkPackage<PackageConcatSA> * >(P);
+		assert ( RP );
+
+		threadConcatSA(RP->package);
+	}
+};
+
+struct FillHistDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef FillHistDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageFillHist> * RP = dynamic_cast< GenericWorkPackage<PackageFillHist> * >(P);
+		assert ( RP );
+
+		threadFillHist(RP->package);
+	}
+};
+
+struct UnifyPackageSizesDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef UnifyPackageSizesDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageUnifyPackageSizes> * RP = dynamic_cast< GenericWorkPackage<PackageUnifyPackageSizes> * >(P);
+		assert ( RP );
+
+		threadUnifyPackageSizes(RP->package);
+	}
+};
+
+struct MergeHistogramsDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef MergeHistogramsDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageMergeHistograms> * RP = dynamic_cast< GenericWorkPackage<PackageMergeHistograms> * >(P);
+		assert ( RP );
+
+		threadMergeHistograms(RP->package);
+	}
+};
+
+struct ConcatenateUniqueDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef ConcatenateUniqueDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageConcatenateUnique> * RP = dynamic_cast< GenericWorkPackage<PackageConcatenateUnique> * >(P);
+		assert ( RP );
+
+		threadConcatenateUnique(RP->package);
+	}
+};
+
+struct SumIntervalsDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef SumIntervalsDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageSumIntervals> * RP = dynamic_cast< GenericWorkPackage<PackageSumIntervals> * >(P);
+		assert ( RP );
+		threadSumIntervals(RP->package);
+	}
+};
+
+struct PrefixSumsDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef PrefixSumsDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackagePrefixSums> * RP = dynamic_cast< GenericWorkPackage<PackagePrefixSums> * >(P);
+		assert ( RP );
+		threadPrefixSums(RP->package);
+	}
+};
+
+struct LookupSADispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef LookupSADispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageLookupSA> * RP = dynamic_cast< GenericWorkPackage<PackageLookupSA> * >(P);
+		assert ( RP );
+		threadLookupSA(RP->package);
+	}
+};
+
+struct CompactPosDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef CompactPosDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageCompactPos> * RP = dynamic_cast< GenericWorkPackage<PackageCompactPos> * >(P);
+		assert ( RP );
+		threadCompactPos(RP->package);
+	}
+};
+
+struct ConcatQueryKmersDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef ConcatQueryKmersDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageConcatQueryKmers> * RP = dynamic_cast< GenericWorkPackage<PackageConcatQueryKmers> * >(P);
+		assert ( RP );
+		threadConcatQueryKmers(RP->package);
+	}
+};
+
+struct EncodeBamDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef EncodeBamDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageEncodeBam> * RP = dynamic_cast< GenericWorkPackage<PackageEncodeBam> * >(P);
+		assert ( RP );
+		threadEncodeBam(RP->package);
+	}
+};
+
+enum dispatcher_ids
+{
+	SearchKmersDispatcher_id = 0,
+	ConcatSADispatcher_id = 1,
+	FillHistDispatcher_id = 2,
+	UnifyPackageSizesDispatcher_id = 3,
+	MergeHistogramsDispatcher_id = 4,
+	ConcatenateUniqueDispatcher_id = 5,
+	SumIntervalsDispatcher_id = 6,
+	PrefixSumsDispatcher_id = 7,
+	LookupSADispatcher_id = 8,
+	CompactPosDispatcher_id = 9,
+	ConcatQueryKmersDispatcher_id = 10,
+	EncodeBamDispatcher_id = 11
+};
+
 int damapper_bwt(libmaus2::util::ArgParser const & arg)
 {
-
 	// default k
 	unsigned int const defk = 20;
 	unsigned int const k = arg.argPresent("k") ? arg.getUnsignedNumericArg<uint64_t>("k") : defk;
@@ -1095,6 +2164,32 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	#else
 	uint64_t const numthreads = 1;
 	#endif
+
+	libmaus2::parallel::SimpleThreadPool STP(numthreads);
+	SearchKmersDispatcher SKD;
+	ConcatSADispatcher CSAD;
+	FillHistDispatcher FHD;
+	UnifyPackageSizesDispatcher UPSD;
+	MergeHistogramsDispatcher MHD;
+	ConcatenateUniqueDispatcher CUD;
+	SumIntervalsDispatcher SID;
+	PrefixSumsDispatcher PSD;
+	LookupSADispatcher LSAD;
+	CompactPosDispatcher CPD;
+	ConcatQueryKmersDispatcher CQKD;
+	EncodeBamDispatcher EBD;
+	STP.registerDispatcher(SearchKmersDispatcher_id,&SKD);
+	STP.registerDispatcher(ConcatSADispatcher_id,&CSAD);
+	STP.registerDispatcher(FillHistDispatcher_id,&FHD);
+	STP.registerDispatcher(UnifyPackageSizesDispatcher_id,&UPSD);
+	STP.registerDispatcher(MergeHistogramsDispatcher_id,&MHD);
+	STP.registerDispatcher(ConcatenateUniqueDispatcher_id,&CUD);
+	STP.registerDispatcher(SumIntervalsDispatcher_id,&SID);
+	STP.registerDispatcher(PrefixSumsDispatcher_id,&PSD);
+	STP.registerDispatcher(LookupSADispatcher_id,&LSAD);
+	STP.registerDispatcher(CompactPosDispatcher_id,&CPD);
+	STP.registerDispatcher(ConcatQueryKmersDispatcher_id,&CQKD);
+	STP.registerDispatcher(EncodeBamDispatcher_id,&EBD);
 
 	std::string const s_supstrat = arg.uniqueArgPresent("S") ? arg["S"] : "none";
 
@@ -1216,37 +2311,6 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	// read meta data
 	libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > O;
 
-	struct RefKMer
-	{
-		uint64_t code;
-		uint64_t low;
-		uint64_t high;
-	};
-
-	struct RefKMerCodeComparator
-	{
-		bool operator()(RefKMer const & A, RefKMer const & B) const
-		{
-			return A.code < B.code;
-		}
-	};
-
-	struct QueryKMer
-	{
-		uint64_t code;
-		uint32_t rpos;
-		uint32_t readid;
-
-		bool operator<(QueryKMer const & O) const
-		{
-			if ( code != O.code )
-				return code < O.code;
-			else if ( readid != O.readid )
-				return readid < O.readid;
-			else
-				return rpos < O.rpos;
-		}
-	};
 
 	uint64_t const refnumposbytes = forwindex.getNumPosBytes();
 	uint64_t const refnumseqbytes = forwindex.getNumSeqBytes();
@@ -1342,26 +2406,6 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		AATC[i] = UNIQUE_PTR_MOVE(Tptr);
 	}
 
-	struct LASToBamContext
-	{
-		typedef LASToBamContext this_type;
-		typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
-
-		libmaus2::dazzler::align::LASToBamConverterBase converter;
-		libmaus2::bambam::parallel::FragmentAlignmentBufferFragment fragment;
-		libmaus2::autoarray::AutoArray<char> ARC;
-
-		LASToBamContext(
-			int64_t const rtspace,
-			bool const rcalmdnm,
-			libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_t rseqstrat,
-			std::string const & rrgid,
-			libmaus2::dazzler::align::RefMapEntryVector const & refmap
-		) : converter(rtspace,rcalmdnm,rseqstrat,rrgid,refmap), fragment(), ARC()
-		{
-
-		}
-	};
 
 	libmaus2::autoarray::AutoArray<LASToBamContext::unique_ptr_type> Acontexts(numthreads);
 	libmaus2::dazzler::align::RefMapEntryVector refmap;
@@ -1389,6 +2433,8 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	accclock.start();
 
 	uint64_t totalreads = 0;
+
+	libmaus2::parallel::PosixSemaphore finsem;
 
 	for ( uint64_t readpart = 1 ; running; ++readpart )
 	{
@@ -1519,98 +2565,13 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 
 			// search kmers
 			lclock.start();
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads) schedule(dynamic,1)
-			#endif
+			std::vector < GenericWorkPackage<PackageSearchKmers> > VSAR(numpacks);
 			for ( uint64_t t = 0; t < numpacks; ++t )
 			{
-				uint64_t const low = t * readsperpack;
-				uint64_t const high = std::min(low+readsperpack,numreads);
-				libmaus2::autoarray::AutoArray < RefKMer > & LRKM = *RKM[t];
-				libmaus2::autoarray::AutoArray < QueryKMer > & LQKM = *QKM[t];
-
-				uint64_t rkmo = 0;
-				uint64_t qkmo = 0;
-
-				uint64_t const kmask = libmaus2::math::lowbits(2*k);
-
-				for ( uint64_t zz = low; zz < high; ++zz )
-				{
-					//char const * const cmapped = Areaddata.begin() + O[zz].dataoff;
-					char * const cmapped = Areaddata.begin() + O[zz].dataoff;
-					uint64_t const m = O[zz].len;
-
-					uint64_t const numk = (m >= k) ? m-k+1 : 0;
-
-					if ( numk && k )
-					{
-						uint64_t v = 0;
-						uint64_t e = 0;
-						char const * c = cmapped;
-
-						for ( uint64_t i = 0; i < k-1; ++i )
-						{
-							v <<= 2;
-							uint64_t const s = *(c++);
-							v |= s & 3;
-							e += (s>>2)&1;
-						}
-						char const * b = cmapped;
-
-						for ( uint64_t ik = 0; ik < numk; ++ik )
-						{
-							v <<= 2;
-							v &= kmask;
-							uint64_t const s = *(c++);
-							v |= s & 3;
-							e += (s >> 2)&1;
-
-							if ( ! e )
-							{
-								std::pair<uint64_t,uint64_t> const P = index.PKcache->search(c-k,k);
-
-								if ( P.second != P.first )
-								{
-									RefKMer K;
-									K.code = v;
-									K.low = P.first;
-									K.high = P.second;
-									LRKM.push(rkmo,K);
-
-									assert ( (K.code & kmask) == K.code );
-
-									QueryKMer Q;
-									Q.code = v;
-									Q.rpos = ik;
-									Q.readid = zz;
-									LQKM.push(qkmo,Q);
-								}
-							}
-
-							uint64_t sa = *(b++);
-							e -= (sa >> 2)&1;
-						}
-					}
-				}
-
-				// sort reference kmers
-				std::sort(LRKM.begin(),LRKM.begin() + rkmo,RefKMerCodeComparator());
-				uint64_t l = 0;
-				uint64_t o = 0;
-				// uniquify
-				while ( l < rkmo )
-				{
-					uint64_t h = l+1;
-					while ( h < rkmo && LRKM[h].code == LRKM[l].code )
-						++h;
-					LRKM[o++] = LRKM[l];
-					l = h;
-				}
-				rkmo = o;
-
-				NUMRK[t] = rkmo;
-				NUMQK[t] = qkmo;
+				VSAR[t] = GenericWorkPackage<PackageSearchKmers>(0,SearchKmersDispatcher_id,PackageSearchKmers(t,readsperpack,numreads,k,&RKM,&QKM,&Areaddata,&O,&NUMRK,&NUMQK,&index,&finsem));
+				STP.enque(&VSAR[t]);
 			}
+			semWait(finsem,numpacks);
 			if ( verbose > 1 )
 				std::cerr << "[V] computed SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
 
@@ -1618,20 +2579,14 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			lclock.start();
 			libmaus2::util::PrefixSums::prefixSums(NUMRK.begin(),NUMRK.begin()+numpacks+1);
 			GRKM.ensureSize(NUMRK[numpacks]);
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads) schedule(dynamic,1)
-			#endif
+
+			std::vector < GenericWorkPackage<PackageConcatSA> > VCSAD(numpacks);
 			for ( uint64_t t = 0; t < numpacks; ++t )
 			{
-				RefKMer * O = GRKM.begin() + NUMRK[t];
-				RefKMer * Oe = GRKM.begin() + NUMRK[t+1];
-				RefKMer * I = RKM[t]->begin();
-
-				while ( O != Oe )
-					*(O++) = *(I++);
-
-				RKM[t]->resize(0);
+				VCSAD[t] = GenericWorkPackage<PackageConcatSA>(0,ConcatSADispatcher_id,PackageConcatSA(t,&GRKM,&NUMRK,&RKM,&finsem));
+				STP.enque(&VCSAD[t]);
 			}
+			semWait(finsem,numpacks);
 			if ( verbose > 1 )
 				std::cerr << "[V] concatenated SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
 
@@ -1674,79 +2629,36 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			for ( uint64_t i = 0; i < ubounds.size(); ++i )
 				assert ( i == 0 || (i+1)==ubounds.size() || GRKM[ubounds[i]-1].code != GRKM[ubounds[i]].code );
 
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads)
-			#endif
+			std::vector < GenericWorkPackage<PackageFillHist> > VPFH(numthreads);
 			for ( uint64_t t = 0; t < numthreads; ++t )
 			{
-				std::fill(
-					Ahist[t]->begin(),
-					Ahist[t]->end(),
-					0ull
-				);
+				VPFH[t] = GenericWorkPackage<PackageFillHist>(0,FillHistDispatcher_id,PackageFillHist(t,&Ahist,&finsem));
+				STP.enque(&VPFH[t]);
 			}
+			semWait(finsem,numthreads);
 
 			// unified package sizes
 			std::vector<uint64_t> usize(ubounds.size());
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads)
-			#endif
+			uint64_t const numuni = ubounds.size() ? (ubounds.size()-1) : 0;
+			std::vector < GenericWorkPackage<PackageUnifyPackageSizes> > VUPS(numuni);
 			for ( uint64_t t = 1; t < ubounds.size(); ++t )
 			{
-				libmaus2::autoarray::AutoArray<uint64_t> & thist = *(Ahist[t-1].get());
-
-				// lower bound
-				uint64_t ulow = ubounds[t-1];
-				// upper bound
-				uint64_t const utop = ubounds[t];
-
-				// output pointer
-				uint64_t uout = ulow;
-				while ( ulow < utop )
-				{
-					// go to end of code
-					uint64_t uhigh = ulow+1;
-					while ( uhigh < utop && GRKM[uhigh].code == GRKM[ulow].code )
-						++uhigh;
-
-					// single output
-					GRKM[uout++] = GRKM[ulow];
-
-					uint64_t const s = GRKM[ulow].high-GRKM[ulow].low;
-					if ( s < histthres )
-						thist [ s ] += 1;
-					else
-						thist [ histthres ] += s;
-
-					ulow = uhigh;
-				}
-
-				// size of package
-				usize[t-1] = uout - ubounds[t-1];
+				VUPS[t-1] = GenericWorkPackage<PackageUnifyPackageSizes>(0,UnifyPackageSizesDispatcher_id,PackageUnifyPackageSizes(t,&Ahist,&GRKM,&ubounds,&usize,histthres,&finsem));
+				STP.enque(&VUPS[t-1]);
 			}
+			semWait(finsem,numuni);
 			// compute prefix sums
 			libmaus2::util::PrefixSums::prefixSums(usize.begin(),usize.end());
 
 			// merge histograms
 			uint64_t const tperthread = (histmult + numthreads - 1)/numthreads;
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads)
-			#endif
+			std::vector < GenericWorkPackage < PackageMergeHistograms > > VPMH(numthreads);
 			for ( uint64_t t = 0; t < numthreads; ++t )
 			{
-				uint64_t const tlow = t * tperthread;
-				uint64_t const thigh = std::min ( tlow + tperthread, histmult );
-
-				uint64_t * const T = Ahist[0]->begin();
-
-				for ( uint64_t j = 1; j < numthreads; ++j )
-				{
-					uint64_t * const S = Ahist[j]->begin();
-
-					for ( uint64_t i = tlow; i < thigh; ++i )
-						T[i] += S[i];
-				}
+				VPMH[t] = GenericWorkPackage < PackageMergeHistograms >(0,MergeHistogramsDispatcher_id,PackageMergeHistograms(t,tperthread,histmult,numthreads,&Ahist,&finsem));
+				STP.enque(&VPMH[t]);
 			}
+			semWait(finsem,numthreads);
 
 			#if 0
 			for ( uint64_t i = 0; i < histmult; ++i )
@@ -1757,34 +2669,16 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			#endif
 
 			// concatenate unique
-			uint64_t gc = 0;
+			uint64_t volatile gc = 0;
 			libmaus2::parallel::PosixSpinLock gclock;
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads)
-			#endif
+			uint64_t const numus = usize.size() ? (usize.size()-1) : 0;
+			std::vector < GenericWorkPackage < PackageConcatenateUnique > > VPCU(numus);
 			for ( uint64_t t = 1; t < usize.size(); ++t )
 			{
-				RefKMer * I = GRKM.begin() + ubounds[t-1];
-				RefKMer * O = TGRKM.begin() + usize[t-1];
-				RefKMer * Oe = TGRKM.begin() + usize[t];
-
-				uint64_t c = 0;
-				while ( O != Oe )
-				{
-					c += I->high-I->low;
-					*(O++) = *(I++);
-				}
-				gclock.lock();
-				gc += c;
-				gclock.unlock();
-
-				#if 0
-				uint64_t cc = 0;
-				for ( RefKMer * C = TGRKM.begin() + usize[t-1]; C != TGRKM.begin() + usize[t]; ++C )
-					cc += C->high-C->low;
-				assert ( cc == c );
-				#endif
+				VPCU[t-1] = GenericWorkPackage < PackageConcatenateUnique >(0,ConcatenateUniqueDispatcher_id,PackageConcatenateUnique(t,&GRKM,&TGRKM,&ubounds,&usize,&gclock,&gc,&finsem));
+				STP.enque(&VPCU[t-1]);
 			}
+			semWait(finsem,numus);
 			GRKM.swap(TGRKM);
 			if ( verbose > 1 )
 				std::cerr << "[V] uniquified in time " << lclock.formatTime(lclock.getElapsedSeconds()) << " num out " << usize.back() << " sum " << gc << std::endl;
@@ -1795,24 +2689,13 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			uint64_t const suthreads = supacksize ? ((usize.back() + supacksize - 1) /supacksize) : 0;
 			PP[0] = 0;
 
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(suthreads)
-			#endif
+			std::vector < GenericWorkPackage < PackageSumIntervals > > VSI(suthreads);
 			for ( uint64_t t = 0; t < suthreads; ++t )
 			{
-				uint64_t const ulow = t * supacksize;
-				uint64_t const uhigh = std::min(ulow+supacksize,usize.back());
-				assert ( uhigh != ulow );
-
-				RefKMer * I  = GRKM.begin() + ulow;
-				RefKMer * Ie = GRKM.begin() + uhigh;
-
-				uint64_t s = 0;
-				for ( ; I != Ie ; ++I )
-					s += I->high-I->low;
-
-				PP[uhigh] = s;
+				VSI[t] = GenericWorkPackage < PackageSumIntervals >(0,SumIntervalsDispatcher_id,PackageSumIntervals(t,supacksize,&usize,&GRKM,&PP,&finsem));
+				STP.enque(&VSI[t]);
 			}
+			semWait(finsem,suthreads);
 
 			for ( uint64_t t = 0; t < suthreads; ++t )
 			{
@@ -1823,27 +2706,13 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 				PP[uhigh] += PP[ulow];
 			}
 
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(suthreads)
-			#endif
+			std::vector < GenericWorkPackage < PackagePrefixSums > > VPPS(suthreads);
 			for ( uint64_t t = 0; t < suthreads; ++t )
 			{
-				uint64_t const ulow = t * supacksize;
-				uint64_t const uhigh = std::min(ulow+supacksize,usize.back());
-				assert ( uhigh != ulow );
-
-				RefKMer * I  = GRKM.begin() + ulow;
-				RefKMer * Ie = GRKM.begin() + uhigh;
-
-				uint64_t * p = PP.begin() + ulow;
-
-				uint64_t s = *p;
-				for ( ; I != Ie ; ++I )
-				{
-					*(p++) = s;
-					s += (I->high-I->low);
-				}
+				VPPS[t] = GenericWorkPackage < PackagePrefixSums >(0,PrefixSumsDispatcher_id,PackagePrefixSums(t,supacksize,&usize,&GRKM,&PP,&finsem));
+				STP.enque(&VPPS[t]);
 			}
+			semWait(finsem,suthreads);
 
 			std::vector<uint64_t> uranges;
 			std::vector<uint64_t> urefk;
@@ -1889,66 +2758,26 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			lclock.start();
 			GRQKM.ensureSize(gc);
 			std::vector<uint64_t> NUMREFKVALID(uranges.size());
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads)
-			#endif
+			uint64_t const numlsa = uranges.size() ? (uranges.size()-1) : 0;
+			std::vector < GenericWorkPackage < PackageLookupSA > > VLSA(numlsa);
 			for ( uint64_t t = 1; t < uranges.size(); ++t )
 			{
-				RefKMer * I  = GRKM.begin() + uranges[t-1];
-				RefKMer * Ie = GRKM.begin() + uranges[t];
-				QueryKMer * O = GRQKM.begin() + urefk[t-1];
-				QueryKMer Q;
-				uint64_t numvalid = 0;
-				uint64_t c = 0;
-
-				for ( ; I != Ie; ++I )
-				{
-					RefKMer const & R = *I;
-					c += R.high-R.low;
-					Q.code = R.code;
-
-					for ( uint64_t jr = R.low; jr < R.high; ++jr )
-					{
-						uint64_t const p = index.lookupSA(jr);
-						std::pair<uint64_t,uint64_t> coord = (*(index.PCC))[p]; // Pindex->mapCoordinates((*SSA)[jr]);
-						if ( index.Pindex->valid(coord,k) )
-						{
-							Q.rpos = coord.second;
-							Q.readid = coord.first;
-							*(O++) = Q;
-							numvalid += 1;
-						}
-						#if 0
-						else
-						{
-							Q.code = std::numeric_limits<uint64_t>::max();
-							Q.rpos = 0;
-							Q.readid = 0;
-							*(O++) = Q;
-						}
-						#endif
-					}
-				}
-				assert ( c == urefk[t]-urefk[t-1] );
-				// assert ( O == GRQKM.begin() + NUMREFK[t] );
-				NUMREFKVALID[t-1] = numvalid;
+				VLSA[t-1] = GenericWorkPackage < PackageLookupSA >(0,LookupSADispatcher_id,PackageLookupSA(t,k,&GRKM,&GRQKM,&uranges,&urefk,&NUMREFKVALID,&index,&finsem));
+				STP.enque(&VLSA[t-1]);
 			}
+			semWait(finsem,numlsa);
 
 			// concatenate
 			libmaus2::util::PrefixSums::prefixSums(NUMREFKVALID.begin(),NUMREFKVALID.end());
 			TGRQKM.ensureSize(NUMREFKVALID.back()+2);
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads)
-			#endif
+			uint64_t const numcomp = uranges.size() ? (uranges.size()-1) : 0;
+			std::vector < GenericWorkPackage < PackageCompactPos > > VCO(numcomp);
 			for ( uint64_t t = 1; t < uranges.size(); ++t )
 			{
-				QueryKMer * I = GRQKM.begin() + urefk[t-1];
-				QueryKMer * O = TGRQKM.begin() + NUMREFKVALID[t-1];
-				QueryKMer * Oe = TGRQKM.begin() + NUMREFKVALID[t];
-
-				while ( O != Oe )
-					*(O++) = *(I++);
+				VCO[t-1] = GenericWorkPackage < PackageCompactPos >(0,CompactPosDispatcher_id,PackageCompactPos(t,&GRQKM,&TGRQKM,&NUMREFKVALID,&urefk,&finsem));
+				STP.enque(&VCO[t-1]);
 			}
+			semWait(finsem,numcomp);
 			GRQKM.swap(TGRQKM);
 
 			assert ( NUMREFKVALID.size() );
@@ -1981,22 +2810,14 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			libmaus2::util::PrefixSums::prefixSums(NUMQK.begin(),NUMQK.begin()+numpacks+1);
 			GQKM.ensureSize(NUMQK[numpacks]+2);
 
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads) schedule(dynamic,1)
-			#endif
+			std::vector < GenericWorkPackage < PackageConcatQueryKmers > > VCQK(numpacks);
 			for ( uint64_t t = 0; t < numpacks; ++t )
 			{
-				libmaus2::autoarray::AutoArray < QueryKMer > & LQKM = *QKM[t];
-
-				QueryKMer const * I = LQKM.begin();
-				QueryKMer * O = GQKM.begin() + NUMQK[t];
-				QueryKMer * Oe = GQKM.begin() + NUMQK[t+1];
-
-				while ( O != Oe )
-					*(O++) = *(I++);
-
-				QKM[t]->resize(0);
+				VCQK[t] = GenericWorkPackage < PackageConcatQueryKmers >(0,ConcatQueryKmersDispatcher_id,PackageConcatQueryKmers(t,&QKM,&GQKM,&NUMQK,&finsem));
+				STP.enque(&VCQK[t]);
 			}
+			semWait(finsem,numpacks);
+			assert ( ! finsem.trywait() );
 			if ( verbose > 1 )
 				std::cerr << "[V] concatenated query kmers in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
 
@@ -2114,9 +2935,12 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 
 			if ( NUMQK[numpacks] && NUMREFKVALID.back() )
 			{
+				lclock.start();
 				QueryKMer * Qindex = GRQKM.take();
 				Match_Filter(&readsdb, &refdb, GQKM.begin(), NUMQK[numpacks], Qindex, NUMREFKVALID.back(), (index_i==1) /* comp */, (index_i==0) /* start */);
 				indexyield += 1;
+				if ( verbose > 1 )
+					std::cerr << "[V] ran Match_Filter in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
 			}
 			else
 			{
@@ -2221,176 +3045,16 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			assert ( ointv.size()-1 <= numthreads );
 			assert ( ointv.back() == OVLdata.size() );
 
-			#if defined(_OPENMP)
-			#pragma omp parallel for num_threads(numthreads)
-			#endif
+			uint64_t const numointv = ointv.size() ? (ointv.size()-1) : 0;
+			std::vector < GenericWorkPackage < PackageEncodeBam > > VEB(numointv);
 			for ( uint64_t zr = 1; zr < ointv.size(); ++zr )
 			{
-				uint64_t tid = zr-1;
-				uint64_t const rlow = ointv[zr-1];
-				uint64_t const rhigh = ointv[zr];
-				LASToBamContext & context = *(Acontexts[tid]);
-				context.fragment.reset();
-
-				// last read id for previous block
-				int64_t const prevb = rlow ? static_cast<int64_t>(libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(rlow-1).first)) : prevmark;
-				// next expected read
-				int64_t nextexpt = prevb+1;
-
-				//std::cerr << "tid " << tid << " " << nextexpt << std::endl;
-
-				// process in batches of equal b read id
-				uint64_t ilow = rlow;
-				while ( ilow < rhigh )
-				{
-					uint64_t ihigh = ilow+1;
-					int64_t const refbread = libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(ilow).first);
-					while ( ihigh < rhigh && libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(ihigh).first) == refbread )
-						++ihigh;
-
-					while ( nextexpt < refbread )
-					{
-						char const * rname = Areadnames.begin() + O[nextexpt].nameoff;
-						char const * rdata = reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[nextexpt].boff;
-						uint64_t const readlen = readsdb.reads[nextexpt].rlen;
-						assert ( rdata[-1] == 4 );
-						assert ( rdata[readlen] == 4 );
-
-						context.converter.convertUnmapped(rdata,readlen,rname,context.fragment,*Pbamheader);
-
-						// std::cerr << "[D] read " << nextexpt << " " << rname << " was not aligned" << " ref " << refbread << std::endl;
-
-						++nextexpt;
-					}
-
-					assert ( nextexpt == refbread );
-
-					uint64_t numchains = 0;
-					for ( uint64_t z = ilow; z < ihigh; ++z )
-					{
-						std::pair<uint8_t const *, uint8_t const *> const P = OVLdata.getData(z);
-						bool const isStart = libmaus2::dazzler::align::OverlapData::getStartFlag(P.first);
-						if ( isStart )
-							numchains++;
-					}
-
-					uint64_t il = ilow;
-					uint64_t chainid = 0;
-					while ( il < ihigh )
-					{
-						uint64_t ih = il+1;
-						while (
-							ih < ihigh
-							&&
-							(!libmaus2::dazzler::align::OverlapData::getStartFlag(OVLdata.getData(ih).first))
-						)
-							++ih;
-
-						uint64_t const lchainid = chainid++;
-						bool const secondary = (lchainid > 0);
-
-						for ( uint64_t z = il; z < ih; ++z )
-						{
-							std::pair<uint8_t const *, uint8_t const *> const P = OVLdata.getData(z);
-
-							int64_t const aread = libmaus2::dazzler::align::OverlapData::getARead(P.first);
-							int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead(P.first);
-							int64_t const flags = libmaus2::dazzler::align::OverlapData::getFlags(P.first);
-							bool const inverse = libmaus2::dazzler::align::OverlapData::getInverseFlag(P.first);
-
-							bool const supplementary = (z != il);
-
-							// bool const primary = libmaus2::dazzler::align::OverlapData::getPrimaryFlag(P.first);
-							uint64_t const readlen = readsdb.reads[bread].rlen;
-
-							if ( z==ilow )
-							{
-								// compute reverse complement
-								context.ARC.ensureSize(readlen + 2);
-
-								char * const ra = context.ARC.begin();
-								char * rp = ra + readlen + 2;
-								char const * src = reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[bread].boff - 1;
-
-								*(--rp)	= (*(src++));
-								while ( rp != ra+1 )
-									*(--rp)	= (*(src++)) ^ 3;
-								*(--rp)	= (*(src++));
-							}
-
-							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_i("ci",lchainid);
-							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_n("cn",numchains);
-							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_j("cj",z-il);
-							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_l("cl",ih-il);
-
-							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * reqs[] =
-							{
-								&req_i,
-								&req_n,
-								&req_j,
-								&req_l
-							};
-
-							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &reqs[0];
-							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &reqs[sizeof(reqs)/sizeof(reqs[0])];
-
-							try
-							{
-								if ( ! inverse )
-								{
-									context.converter.convert(
-										P.first,
-										reinterpret_cast<char const *>(refdb.bases) + refdb.reads[aread].boff,
-										refdb.reads[aread].rlen,
-										reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[bread].boff,
-										readsdb.reads[bread].rlen,
-										Areadnames.begin() + O[bread].nameoff,
-										context.fragment,
-										secondary,
-										supplementary,
-										*Pbamheader,
-										aux_a,
-										aux_e
-									);
-								}
-								else
-								{
-									context.converter.convert(
-										P.first,
-										reinterpret_cast<char const *>(refdb.bases) + refdb.reads[aread].boff,
-										refdb.reads[aread].rlen,
-										context.ARC.begin()+1 /* skip terminator */,
-										readlen,
-										Areadnames.begin() + O[bread].nameoff,
-										context.fragment,
-										secondary,
-										supplementary,
-										*Pbamheader,
-										aux_a,
-										aux_e
-									);
-								}
-							}
-							catch(std::exception const & ex)
-							{
-								std::cerr << ex.what() << std::endl;
-								std::cerr
-									<< aread << " "
-									<< bread << " "
-									<< flags
-									<< std::endl;
-							}
-						}
-
-
-						il = ih;
-					}
-
-					nextexpt += 1;
-
-					ilow = ihigh;
-				}
+				VEB[zr-1] = GenericWorkPackage < PackageEncodeBam >(
+					0,EncodeBamDispatcher_id,PackageEncodeBam(zr,&ointv,&Acontexts,&OVLdata,prevmark,&Areadnames,&Pbamheader,&O,&refdb,&readsdb,&finsem)
+				);
+				STP.enque(&VEB[zr-1]);
 			}
+			semWait(finsem,numointv);
 
 			for ( uint64_t zr = 1; zr < ointv.size(); ++zr )
 			{
@@ -2442,6 +3106,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 
 	Free_Align_Spec(aspec);
 
+	STP.terminate();
 
 	return EXIT_SUCCESS;
 }
