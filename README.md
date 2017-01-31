@@ -52,6 +52,8 @@ The following parameters can be used (no space allowed between option an argumen
 * -T: prefix for temporary files during index construction
 * -Q: index file name (defaults to .damapper_bwt appended to reference file name)
 * -S: sequence storage strategy for non primary alignments (none, soft, hard)
+* -z: output BAM compression level (zlib default)
+* -I: input format (fasta (default) or bam)
 
 BAM output files
 ----------------
