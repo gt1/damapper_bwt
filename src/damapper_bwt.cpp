@@ -843,11 +843,16 @@ struct DNAIndex : public DNAIndexBase
 		return UNIQUE_PTR_MOVE(Pbamheader);
 	}
 
-	void loadBP(std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> & Vseqmeta, libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> & Aseq, uint64_t const numthreads)
+	void loadBP(
+		libmaus2::parallel::SimpleThreadPool & STP,
+		std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> & Vseqmeta,
+		libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> & Aseq,
+		uint64_t const numthreads
+	)
 	{
 		libmaus2::aio::InputStreamInstance::unique_ptr_type membpISI(new libmaus2::aio::InputStreamInstance(membpname));
 		libmaus2::fastx::FastaBPDecoderIdentity fabpdec(*membpISI);
-		fabpdec.decodeSequencesParallel(membpname,numthreads,Aseq,Vseqmeta,true /* map */,4 /* pad symbol */,false /* addrc */);
+		fabpdec.decodeSequencesParallel(STP,membpname,numthreads,Aseq,Vseqmeta,true /* map */,4 /* pad symbol */,false /* addrc */);
 		assert ( Vseqmeta.size() == PFAI->size() );
 	}
 
@@ -2597,7 +2602,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 				GRKM.begin(),GRKM.begin()+NUMRK[numpacks],
 				TGRKM.begin(),TGRKM.begin()+NUMRK[numpacks],
 				numthreads,
-				keybytes.begin(),numkeybytes);
+				keybytes.begin(),numkeybytes,STP);
 			if ( verbose > 1 )
 				std::cerr << "[V] sorted concatenated SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
 			if ( numkeybytes % 2 == 1 )
@@ -2789,7 +2794,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 				GRQKM.begin(),GRQKM.begin()+NUMREFKVALID.back(),
 				TGRQKM.begin(),TGRQKM.begin()+NUMREFKVALID.back(),
 				numthreads,
-				qfullkeybytes.begin(),qfullkeybytes.size()
+				qfullkeybytes.begin(),qfullkeybytes.size(),STP
 			);
 			if ( qfullkeybytes.size() % 2 != 0 )
 				GRQKM.swap(TGRQKM);
@@ -2828,7 +2833,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 				GQKM.begin(),GQKM.begin()+NUMQK[numpacks],
 				TGQKM.begin(),TGQKM.begin()+NUMQK[numpacks],
 				numthreads,
-				keybytes.begin(),numkeybytes);
+				keybytes.begin(),numkeybytes,STP);
 			if ( verbose > 1 )
 				std::cerr << "[V] sorted query kmers in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
 			if ( numkeybytes % 2 == 1 )
@@ -2869,7 +2874,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			lclock.start();
 			std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> Vseqmeta;
 			libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> Aseq;
-			index.loadBP(Vseqmeta,Aseq,numthreads);
+			index.loadBP(STP,Vseqmeta,Aseq,numthreads);
 			index.fillDazzlerDB(refdb,AREFHITREADS,Vseqmeta,Aseq.begin());
 			if ( verbose > 1 )
 				std::cerr << "[V] decode ref seqs in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
@@ -2953,7 +2958,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		lclock.start();
 		std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> Vseqmeta;
 		libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> Aseq;
-		forwindex.loadBP(Vseqmeta,Aseq,numthreads);
+		forwindex.loadBP(STP,Vseqmeta,Aseq,numthreads);
 		forwindex.fillDazzlerDB(refdb,AREFHITREADS,Vseqmeta,Aseq.begin());
 		if ( verbose > 1 )
 			std::cerr << "[V] decode ref seqs in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
