@@ -17,10 +17,12 @@
 */
 //#define LASTOBAM_PRINT_SAM
 
+#include <config.h>
 #include <libmaus2/aio/SynchronousGenericInput.hpp>
 #include <libmaus2/bambam/BamAlignmentEncoderBase.hpp>
 #include <libmaus2/bambam/BamBlockWriterBaseFactory.hpp>
 #include <libmaus2/bambam/BamHeader.hpp>
+#include <libmaus2/bambam/BamAlignmentDecoder.hpp>
 #include <libmaus2/bambam/CigarStringParser.hpp>
 #include <libmaus2/bitio/CompactArrayWriterFile.hpp>
 #include <libmaus2/dazzler/align/AlignmentWriter.hpp>
@@ -75,6 +77,82 @@
 #include <libmaus2/parallel/SimpleThreadWorkPackageDispatcher.hpp>
 #include <libmaus2/parallel/SimpleThreadPool.hpp>
 #include <libmaus2/util/Demangle.hpp>
+#include <libmaus2/bambam/BamAlignmentDecoderFactory.hpp>
+#include <libmaus2/bambam/ProgramHeaderLineSet.hpp>
+#include <libmaus2/lz/BgzfDeflateOutputBufferBase.hpp>
+#include <libmaus2/parallel/LockedGrowingFreeList.hpp>
+
+static int getDefaultLevel() { return Z_DEFAULT_COMPRESSION; }
+
+struct BgzfDeflateOutputBufferBaseTypeInfo
+{
+	typedef libmaus2::lz::BgzfDeflateOutputBufferBase element_type;
+	typedef element_type::shared_ptr_type pointer_type;
+
+	static pointer_type getNullPointer()
+	{
+		pointer_type p;
+		return p;
+	}
+
+	static pointer_type deallocate(pointer_type /* p */)
+	{
+		return getNullPointer();
+	}
+};
+
+struct BgzfDeflateOutputBufferBaseAllocator
+{
+	typedef libmaus2::lz::BgzfDeflateOutputBufferBase element_type;
+
+	int level;
+
+	BgzfDeflateOutputBufferBaseAllocator(int const rlevel = Z_DEFAULT_COMPRESSION) : level(rlevel)
+	{
+
+	}
+
+	element_type::shared_ptr_type operator()() const
+	{
+		element_type::shared_ptr_type tptr(new element_type(level));
+		return tptr;
+	}
+};
+
+struct BgzfDeflateZStreamBaseTypeInfo
+{
+	typedef libmaus2::lz::BgzfDeflateZStreamBase element_type;
+	typedef element_type::shared_ptr_type pointer_type;
+
+	static pointer_type getNullPointer()
+	{
+		pointer_type p;
+		return p;
+	}
+
+	static pointer_type deallocate(pointer_type /* p */)
+	{
+		return getNullPointer();
+	}
+};
+
+struct BgzfDeflateZStreamBaseAllocator
+{
+	typedef libmaus2::lz::BgzfDeflateZStreamBase element_type;
+
+	int level;
+
+	BgzfDeflateZStreamBaseAllocator(int const rlevel = Z_DEFAULT_COMPRESSION) : level(rlevel)
+	{
+
+	}
+
+	element_type::shared_ptr_type operator()() const
+	{
+		element_type::shared_ptr_type tptr(new element_type(level));
+		return tptr;
+	}
+};
 
 // damapper interface
 
@@ -812,33 +890,66 @@ struct DNAIndex : public DNAIndexBase
 		return true;
 	}
 
-	libmaus2::bambam::BamHeader::unique_ptr_type getBamHeader(std::map<std::string,std::string> const & m5map, std::string const & refurl)
+	libmaus2::bambam::BamHeader::unique_ptr_type getBamHeader(std::map<std::string,std::string> const & m5map, std::string const & refurl, libmaus2::bambam::BamHeader const * inheader, libmaus2::util::ArgParser const & arg)
 	{
-		std::string storeurl;
+		std::ostringstream samheaderstr;
+		bool havehd = false;
 
+		if ( inheader )
+		{
+			std::vector<libmaus2::bambam::HeaderLine> VH = libmaus2::bambam::HeaderLine::extractLines(inheader->text);
+
+			for ( uint64_t i = 0; i < VH.size(); ++i )
+				if ( VH[i].type != "SQ" )
+				{
+					samheaderstr << VH[i].line << "\n";
+					if ( VH[i].type == "HD" )
+						havehd = true;
+				}
+		}
+
+		if ( ! havehd )
+		{
+			samheaderstr << "@HD\tVN:1.5\tSO:unknown\n";
+		}
+
+		std::ostringstream sqheaderstr;
+		std::string storeurl;
 		if ( startsWithAlphaColon(refurl) )
 			storeurl = refurl;
 		else if (refurl.size() && refurl[0] == '/')
 			storeurl = std::string("file:") + refurl;
 		else
 			storeurl = std::string("file:") + getCurrentDir() + "/" + refurl;
-
-		std::ostringstream samheaderstr;
-		samheaderstr << "@HD\tVN:1.5\tSO:unknown\n";
 		for ( uint64_t i = 0; i < PFAI->size(); ++i )
 		{
 			libmaus2::fastx::FastAIndexEntry const & entry = (*PFAI)[i];
-			samheaderstr << "@SQ\tSN:" << entry.name << "\tLN:" << entry.length;
+			sqheaderstr << "@SQ\tSN:" << entry.name << "\tLN:" << entry.length;
 
 			if ( m5map.find(entry.name) != m5map.end() )
-				samheaderstr << "\tM5:" << m5map.find(entry.name)->second;
+				sqheaderstr << "\tM5:" << m5map.find(entry.name)->second;
 
-			samheaderstr << "\tUR:" << storeurl;
+			sqheaderstr << "\tUR:" << storeurl;
 
-			samheaderstr << "\n";
+			sqheaderstr << "\n";
 		}
-		// std::cerr << samheaderstr.str();
-		libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(new libmaus2::bambam::BamHeader(samheaderstr.str()));
+
+		samheaderstr << sqheaderstr.str();
+
+		std::string headertext = samheaderstr.str();
+
+		std::string const upheadtext = ::libmaus2::bambam::ProgramHeaderLineSet::addProgramLine(
+			headertext,
+			"damapper_bwt", // ID
+			"damapper_bwt", // PN
+			arg.commandlinecoded, // CL
+			::libmaus2::bambam::ProgramHeaderLineSet(headertext).getLastIdInChain(), // PP
+			std::string(PACKAGE_VERSION) // VN
+		);
+
+		libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(new libmaus2::bambam::BamHeader(upheadtext));
+
+		Pbamheader->changeSortOrder("unknown");
 
 		return UNIQUE_PTR_MOVE(Pbamheader);
 	}
@@ -1715,6 +1826,11 @@ struct PackageEncodeBam
 	libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > const * O;
 	HITS_DB * refdb;
 	HITS_DB * readsdb;
+
+	libmaus2::autoarray::AutoArray<uint8_t> * Abam;
+	libmaus2::autoarray::AutoArray< uint64_t > * Obam;
+	uint64_t oobam;
+
 	libmaus2::parallel::PosixSemaphore *finsem;
 
 	PackageEncodeBam() {}
@@ -1730,9 +1846,12 @@ struct PackageEncodeBam
 		libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > const * rO,
 		HITS_DB * rrefdb,
 		HITS_DB * rreadsdb,
+		libmaus2::autoarray::AutoArray<uint8_t> * rAbam,
+		libmaus2::autoarray::AutoArray< uint64_t > * rObam,
+		uint64_t roobam,
 		libmaus2::parallel::PosixSemaphore *rfinsem
 	) : zr(rzr), ointv(rointv), Acontexts(rAcontexts), OVLdata(rOVLdata), prevmark(rprevmark), Areadnames(rAreadnames),
-	    Pbamheader(rPbamheader), O(rO), refdb(rrefdb), readsdb(rreadsdb), finsem(rfinsem)
+	    Pbamheader(rPbamheader), O(rO), refdb(rrefdb), readsdb(rreadsdb), Abam(rAbam), Obam(rObam), oobam(roobam), finsem(rfinsem)
 	{
 
 	}
@@ -1788,6 +1907,27 @@ static void threadEncodeBam(PackageEncodeBam package)
 				numchains++;
 		}
 
+		libmaus2::bambam::BamAuxFilterVector auxfilter;
+		auxfilter.set('A','S');
+		auxfilter.set('M','D');
+		auxfilter.set('N','M');
+		auxfilter.set('c','i');
+		auxfilter.set('c','n');
+		auxfilter.set('c','j');
+		auxfilter.set('c','l');
+		libmaus2::autoarray::AutoArray < libmaus2::bambam::BamAlignmentDecoderBase::AuxInfo > auxinfo;
+		libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * > Aauxadd;
+		libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest > Aauxcopy;
+
+		uint8_t * pbam = 0;
+		uint64_t bamlen = 0;
+
+		if ( refbread + 1 < static_cast<int64_t>(package.oobam) )
+		{
+			pbam = package.Abam->begin() + package.Obam->at(refbread);
+			bamlen = package.Obam->at(refbread+1)-package.Obam->at(refbread);
+		}
+
 		uint64_t il = ilow;
 		uint64_t chainid = 0;
 		while ( il < ihigh )
@@ -1811,6 +1951,29 @@ static void threadEncodeBam(PackageEncodeBam package)
 				int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead(P.first);
 				int64_t const flags = libmaus2::dazzler::align::OverlapData::getFlags(P.first);
 				bool const inverse = libmaus2::dazzler::align::OverlapData::getInverseFlag(P.first);
+				char const * readname = (package.Areadnames)->begin() + (*(package.O))[bread].nameoff;
+
+				uint64_t oauxcopy = 0;
+				if ( pbam )
+				{
+					uint64_t const naux = libmaus2::bambam::BamAlignmentDecoderBase::enumerateAuxTagsFilterOut(pbam,bamlen,auxinfo,auxfilter);
+
+					for ( uint64_t i = 0; i < naux; ++i )
+					{
+						Aauxcopy.push(
+							oauxcopy,
+							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest(pbam + auxinfo[i].o,auxinfo[i].l)
+						);
+						// std::cerr << "[" << i << "] " << auxinfo[i].tag[0] << auxinfo[i].tag[1] << std::endl;
+					}
+				}
+
+				#if 0
+				if ( pbam )
+				{
+					std::cerr << readname << "\t" << libmaus2::bambam::BamAlignmentDecoderBase::getReadName(pbam) << std::endl;
+				}
+				#endif
 
 				bool const supplementary = (z != il);
 
@@ -1832,21 +1995,23 @@ static void threadEncodeBam(PackageEncodeBam package)
 					*(--rp)	= (*(src++));
 				}
 
+				uint64_t oauxadd = 0;
 				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_i("ci",lchainid);
 				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_n("cn",numchains);
 				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_j("cj",z-il);
 				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_l("cl",ih-il);
 
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * reqs[] =
-				{
-					&req_i,
-					&req_n,
-					&req_j,
-					&req_l
-				};
+				Aauxadd.push(oauxadd,&req_i);
+				Aauxadd.push(oauxadd,&req_n);
+				Aauxadd.push(oauxadd,&req_j);
+				Aauxadd.push(oauxadd,&req_l);
+				for ( uint64_t i = 0; i < oauxcopy; ++i )
+					Aauxadd.push(oauxadd,&Aauxcopy[i]);
 
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &reqs[0];
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &reqs[sizeof(reqs)/sizeof(reqs[0])];
+				// MD,NM,AS,ci,cn,cj,cl
+
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &Aauxadd[0];
+				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &Aauxadd[oauxadd];
 
 				try
 				{
@@ -1858,7 +2023,7 @@ static void threadEncodeBam(PackageEncodeBam package)
 							(package.refdb)->reads[aread].rlen,
 							reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff,
 							(package.readsdb)->reads[bread].rlen,
-							(package.Areadnames)->begin() + (*(package.O))[bread].nameoff,
+							readname,
 							context.fragment,
 							secondary,
 							supplementary,
@@ -1875,7 +2040,7 @@ static void threadEncodeBam(PackageEncodeBam package)
 							(package.refdb)->reads[aread].rlen,
 							context.ARC.begin()+1 /* skip terminator */,
 							readlen,
-							(package.Areadnames)->begin() + (*(package.O))[bread].nameoff,
+							readname,
 							context.fragment,
 							secondary,
 							supplementary,
@@ -2119,6 +2284,7 @@ struct EncodeBamDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageD
 	}
 };
 
+#if 0
 enum dispatcher_ids
 {
 	SearchKmersDispatcher_id = 0,
@@ -2134,6 +2300,7 @@ enum dispatcher_ids
 	ConcatQueryKmersDispatcher_id = 10,
 	EncodeBamDispatcher_id = 11
 };
+#endif
 
 int damapper_bwt(libmaus2::util::ArgParser const & arg)
 {
@@ -2163,6 +2330,12 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	uint64_t const defaultbwtconstrmem = (MEM_PHYSICAL*3)/4;
 	uint64_t const bwtconstrmem = arg.argPresent("bwtconstrmem") ? std::max(static_cast<uint64_t>(1),arg.getUnsignedNumericArg<uint64_t>("bwtconstrmem")) : defaultbwtconstrmem;
 
+	int const level = arg.uniqueArgPresent("z") ? arg.getParsedArg<int64_t>("z") : getDefaultLevel();
+	BgzfDeflateOutputBufferBaseAllocator bgzfalloc(level);
+	libmaus2::parallel::LockedGrowingFreeList<libmaus2::lz::BgzfDeflateOutputBufferBase,BgzfDeflateOutputBufferBaseAllocator,BgzfDeflateOutputBufferBaseTypeInfo> bgzffreelist(bgzfalloc);
+	BgzfDeflateZStreamBaseAllocator bgzfzalloc(level);
+	libmaus2::parallel::LockedGrowingFreeList<libmaus2::lz::BgzfDeflateZStreamBase,BgzfDeflateZStreamBaseAllocator,BgzfDeflateZStreamBaseTypeInfo> zstreambasefreelist(bgzfzalloc);
+
 	#if defined(_OPENMP)
 	uint64_t const defnumproc = libmaus2::parallel::NumCpus::getNumLogicalProcessors();
 	uint64_t const numthreads = arg.argPresent("p") ? std::max(static_cast<uint64_t>(1),arg.getUnsignedNumericArg<uint64_t>("p")) : defnumproc;
@@ -2171,949 +2344,1094 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	#endif
 
 	libmaus2::parallel::SimpleThreadPool STP(numthreads);
-	SearchKmersDispatcher SKD;
-	ConcatSADispatcher CSAD;
-	FillHistDispatcher FHD;
-	UnifyPackageSizesDispatcher UPSD;
-	MergeHistogramsDispatcher MHD;
-	ConcatenateUniqueDispatcher CUD;
-	SumIntervalsDispatcher SID;
-	PrefixSumsDispatcher PSD;
-	LookupSADispatcher LSAD;
-	CompactPosDispatcher CPD;
-	ConcatQueryKmersDispatcher CQKD;
-	EncodeBamDispatcher EBD;
-	STP.registerDispatcher(SearchKmersDispatcher_id,&SKD);
-	STP.registerDispatcher(ConcatSADispatcher_id,&CSAD);
-	STP.registerDispatcher(FillHistDispatcher_id,&FHD);
-	STP.registerDispatcher(UnifyPackageSizesDispatcher_id,&UPSD);
-	STP.registerDispatcher(MergeHistogramsDispatcher_id,&MHD);
-	STP.registerDispatcher(ConcatenateUniqueDispatcher_id,&CUD);
-	STP.registerDispatcher(SumIntervalsDispatcher_id,&SID);
-	STP.registerDispatcher(PrefixSumsDispatcher_id,&PSD);
-	STP.registerDispatcher(LookupSADispatcher_id,&LSAD);
-	STP.registerDispatcher(CompactPosDispatcher_id,&CPD);
-	STP.registerDispatcher(ConcatQueryKmersDispatcher_id,&CQKD);
-	STP.registerDispatcher(EncodeBamDispatcher_id,&EBD);
 
-	std::string const s_supstrat = arg.uniqueArgPresent("S") ? arg["S"] : "none";
+	try
+	{
+		SearchKmersDispatcher SKD;
+		ConcatSADispatcher CSAD;
+		FillHistDispatcher FHD;
+		UnifyPackageSizesDispatcher UPSD;
+		MergeHistogramsDispatcher MHD;
+		ConcatenateUniqueDispatcher CUD;
+		SumIntervalsDispatcher SID;
+		PrefixSumsDispatcher PSD;
+		LookupSADispatcher LSAD;
+		CompactPosDispatcher CPD;
+		ConcatQueryKmersDispatcher CQKD;
+		EncodeBamDispatcher EBD;
+		uint64_t const SearchKmersDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const ConcatSADispatcher_id = STP.getNextDispatcherId();
+		uint64_t const FillHistDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const UnifyPackageSizesDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const MergeHistogramsDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const ConcatenateUniqueDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const SumIntervalsDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const PrefixSumsDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const LookupSADispatcher_id = STP.getNextDispatcherId();
+		uint64_t const CompactPosDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const ConcatQueryKmersDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const EncodeBamDispatcher_id = STP.getNextDispatcherId();
+		STP.registerDispatcher(SearchKmersDispatcher_id,&SKD);
+		STP.registerDispatcher(ConcatSADispatcher_id,&CSAD);
+		STP.registerDispatcher(FillHistDispatcher_id,&FHD);
+		STP.registerDispatcher(UnifyPackageSizesDispatcher_id,&UPSD);
+		STP.registerDispatcher(MergeHistogramsDispatcher_id,&MHD);
+		STP.registerDispatcher(ConcatenateUniqueDispatcher_id,&CUD);
+		STP.registerDispatcher(SumIntervalsDispatcher_id,&SID);
+		STP.registerDispatcher(PrefixSumsDispatcher_id,&PSD);
+		STP.registerDispatcher(LookupSADispatcher_id,&LSAD);
+		STP.registerDispatcher(CompactPosDispatcher_id,&CPD);
+		STP.registerDispatcher(ConcatQueryKmersDispatcher_id,&CQKD);
+		STP.registerDispatcher(EncodeBamDispatcher_id,&EBD);
 
-	libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_t e_supstrat;
+		std::string const s_supstrat = arg.uniqueArgPresent("S") ? arg["S"] : "none";
 
-	if ( s_supstrat == "none" )
-	{
-		e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_none;
-	}
-	else if ( s_supstrat == "soft" )
-	{
-		e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_soft;
-	}
-	else if ( s_supstrat == "hard" )
-	{
-		e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_hard;
-	}
-	else
-	{
-		libmaus2::exception::LibMausException lme;
-		lme.getStream() << "[E] unknown storage strategy " << s_supstrat << std::endl;
-		lme.finish();
-		throw lme;
-	}
+		libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_t e_supstrat;
 
-	uint64_t const defmemlimit = 0;
-	uint64_t const memlimit = arg.uniqueArgPresent("M") ? arg.getUnsignedNumericArg<uint64_t>("M") : defmemlimit;
-	if ( memlimit )
-		MEM_LIMIT = memlimit;
+		if ( s_supstrat == "none" )
+		{
+			e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_none;
+		}
+		else if ( s_supstrat == "soft" )
+		{
+			e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_soft;
+		}
+		else if ( s_supstrat == "hard" )
+		{
+			e_supstrat = libmaus2::dazzler::align::LASToBamConverterBase::supplementary_seq_strategy_hard;
+		}
+		else
+		{
+			libmaus2::exception::LibMausException lme;
+			lme.getStream() << "[E] unknown storage strategy " << s_supstrat << std::endl;
+			lme.finish();
+			throw lme;
+		}
 
-	if ( verbose > 1 )
-	{
-		std::cerr << "[V] physical memory " << MEM_PHYSICAL << std::endl;
+		// std::cerr << "e_supstrat=" << static_cast<int>(e_supstrat) << " " << s_supstrat << std::endl;
+
+		uint64_t const defmemlimit = 0;
+		uint64_t const memlimit = arg.uniqueArgPresent("M") ? arg.getUnsignedNumericArg<uint64_t>("M") : defmemlimit;
 		if ( memlimit )
-			std::cerr << "[V] mem limit " << memlimit << std::endl;
-	}
+			MEM_LIMIT = memlimit;
 
-	std::string const fastaname = arg[0];
-	std::string const combfn = arg.uniqueArgPresent("Q") ? arg["Q"] : (fastaname + ".damapper_bwt");
-
-	if (
-		(! libmaus2::util::GetFileSize::fileExists(combfn))
-		||
-		libmaus2::util::GetFileSize::isOlder(combfn,fastaname)
-	)
-	{
-		DNAIndexBuild forwindex;
-		DNAIndexBuild rcindex;
-
-		std::string const tmpprefix = arg.uniqueArgPresent("T") ? arg["T"] : libmaus2::util::ArgInfo::getDefaultTmpFileName(arg.progname);
-		std::string const indexcreatefn = tmpprefix + "_damapper_bwt_index_create";
-		libmaus2::util::TempFileRemovalContainer::addTempFile(indexcreatefn);
-
-		libmaus2::aio::OutputStreamInstance::unique_ptr_type combOSI(new libmaus2::aio::OutputStreamInstance(indexcreatefn));
-		forwindex.setupFromFasta(fastaname,tmpprefix,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,*combOSI);
-		rcindex.setupFromForwardCompact(fastaname,tmpprefix,forwindex.fainame,forwindex.compactname,forwindex.metaname,forwindex.replname,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,*combOSI);
-
-		std::string const m5info = tmpprefix+".m5infos";
-		libmaus2::aio::InputStreamInstance ISI(fastaname);
-		libmaus2::fastx::FastAStreamSet FASS(ISI);
-		std::map<std::string,std::string> m5map = FASS.computeMD5(false,false);
-
-		libmaus2::util::NumberSerialisation::serialiseNumber(*combOSI,m5map.size());
-		for ( std::map<std::string,std::string>::const_iterator ita = m5map.begin(); ita != m5map.end(); ++ita )
-		{
-			libmaus2::util::StringSerialisation::serialiseString(*combOSI,ita->first);
-			libmaus2::util::StringSerialisation::serialiseString(*combOSI,ita->second);
-		}
-
-		combOSI->flush();
-		combOSI.reset();
-
-		forwindex.cleanup();
-		rcindex.cleanup();
-
-		// rename
-		libmaus2::aio::OutputStreamFactoryContainer::rename(indexcreatefn,combfn);
-	}
-
-	DNAIndex forwindex;
-	DNAIndex rcindex;
-
-	libmaus2::aio::InputStreamInstance::unique_ptr_type combISI(new libmaus2::aio::InputStreamInstance(combfn));
-	forwindex.loadFromSingleForward(*combISI,numthreads,cache_k,verbose);
-	rcindex.loadFromSingleReverseComplement(*combISI,numthreads,cache_k,verbose);
-
-	std::map<std::string,std::string> m5map;
-	uint64_t const sm5 = libmaus2::util::NumberSerialisation::deserialiseNumber(*combISI);
-	for ( uint64_t i = 0; i < sm5; ++i )
-	{
-		std::string const key = libmaus2::util::StringSerialisation::deserialiseString(*combISI);
-		std::string const value = libmaus2::util::StringSerialisation::deserialiseString(*combISI);
-		m5map[key] = value;
-	}
-
-	combISI.reset();
-
-	libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(forwindex.getBamHeader(m5map,fastaname));
-
-	std::vector < DNAIndex * > indexes;
-	indexes.push_back(&forwindex);
-	indexes.push_back(&rcindex);
-
-	float freq[4] = { 0.25, 0.25, 0.25, 0.25 };
-	int64_t const tspace = 100;
-	Align_Spec * aspec = New_Align_Spec(0.85, tspace, &freq[0]);
-	Set_Filter_Params(k, 0, numthreads);
-
-	libmaus2::fastx::LineBufferFastAReader LBFA(std::cin);
-	bool running = true;
-
-	libmaus2::timing::RealTimeClock roundclock;
-	libmaus2::timing::RealTimeClock lclock;
-
-	// read names
-	libmaus2::autoarray::AutoArray<char> Areadnames;
-	// read base data
-	libmaus2::autoarray::AutoArray<char> Areaddata;
-	// read meta data
-	libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > O;
-
-
-	uint64_t const refnumposbytes = forwindex.getNumPosBytes();
-	uint64_t const refnumseqbytes = forwindex.getNumSeqBytes();
-	uint64_t const numkeybits = 2*k;
-	uint64_t const numkeybytes = (numkeybits + 7)/8;
-
-	std::vector<unsigned int> qfullkeybytes;
-	#if defined(LIBMAUS2_BYTE_ORDER_LITTLE_ENDIAN)
-	// position in sequence
-	for ( unsigned int i = 0; i < refnumposbytes; ++i )
-		qfullkeybytes.push_back(sizeof(uint64_t)+i);
-	// sequence id
-	for ( unsigned int i = 0; i < refnumseqbytes; ++i )
-		qfullkeybytes.push_back(sizeof(uint64_t)+sizeof(uint32_t)+i);
-	// code
-	for ( unsigned int i = 0; i < numkeybytes; ++i )
-		qfullkeybytes.push_back(i);
-	#else
-	#error "Unsupported byte order"
-	#endif
-
-	uint64_t const packsperthread = 32;
-	uint64_t const tnumpacks = packsperthread*numthreads;
-
-	// query intervals on suffix array (divided into packages)
-	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < RefKMer >::unique_ptr_type > RKM(tnumpacks);
-	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < QueryKMer >::unique_ptr_type > QKM(tnumpacks);
-
-	libmaus2::autoarray::AutoArray< uint64_t > NUMRK(tnumpacks+1);
-	libmaus2::autoarray::AutoArray< uint64_t > NUMQK(tnumpacks+1);
-	libmaus2::autoarray::AutoArray< uint64_t > NUMRV(tnumpacks+1);
-
-	// ref db read array
-	libmaus2::autoarray::AutoArray< HITS_READ > AREFHITREADS;
-	libmaus2::autoarray::AutoArray< HITS_READ > AREADREADS;
-	HITS_DB refdb;
-
-	for ( uint64_t i = 0; i < RKM.size(); ++i )
-	{
-		libmaus2::autoarray::AutoArray < RefKMer >::unique_ptr_type tptr(new libmaus2::autoarray::AutoArray < RefKMer >);
-		RKM[i] = UNIQUE_PTR_MOVE(tptr);
-	}
-	for ( uint64_t i = 0; i < QKM.size(); ++i )
-	{
-		libmaus2::autoarray::AutoArray < QueryKMer >::unique_ptr_type tptr(new libmaus2::autoarray::AutoArray < QueryKMer >);
-		QKM[i] = UNIQUE_PTR_MOVE(tptr);
-	}
-
-	libmaus2::autoarray::AutoArray < RefKMer > GRKM;
-	libmaus2::autoarray::AutoArray < RefKMer > TGRKM;
-	libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > GQKM;
-	libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > TGQKM;
-	libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > GRQKM;
-	libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > TGRQKM;
-
-	// key bytes for code sorting
-	std::vector<unsigned int> keybytes;
-	#if defined(LIBMAUS2_BYTE_ORDER_LITTLE_ENDIAN)
-	for ( uint64_t i = 0; i < numkeybytes; ++i )
-		keybytes.push_back(i);
-	#elif defined(LIBMAUS2_BYTE_ORDER_BIG_ENDIAN)
-	for ( uint64_t i = 0; i < numkeybytes; ++i )
-		keybytes.push_back(sizeof(uint64_t) - i - 1);
-	#else
-	#error "Unknown byte order"
-	#endif
-
-	// invalid query kmer
-	QueryKMer QIff;
-	QIff.code = std::numeric_limits<uint64_t>::max();
-	QIff.rpos = std::numeric_limits<uint32_t>::max();
-	QIff.readid = std::numeric_limits<uint32_t>::max();
-	QueryKMer QI0;
-	QI0.code = 0;
-	QI0.rpos = std::numeric_limits<uint32_t>::max();
-	QI0.readid = std::numeric_limits<uint32_t>::max();
-
-	libmaus2::lz::BgzfDeflate<std::ostream>::unique_ptr_type bgzfout(new libmaus2::lz::BgzfDeflate<std::ostream>(std::cout,Z_NO_COMPRESSION));
-	Pbamheader->serialise(*bgzfout);
-
-	AlignerAllocator alignalloc;
-	libmaus2::autoarray::AutoArray< libmaus2::lcs::Aligner::shared_ptr_type > Aaligners(numthreads);
-	for ( uint64_t i = 0; i < Aaligners.size(); ++i )
-	{
-		libmaus2::lcs::Aligner::shared_ptr_type Paligner = alignalloc();
-		Aaligners[i] = Paligner;
-	}
-
-	libmaus2::autoarray::AutoArray< libmaus2::lcs::AlignmentTraceContainer::unique_ptr_type > AATC(numthreads);
-	for ( uint64_t i = 0; i < AATC.size(); ++i )
-	{
-		libmaus2::lcs::AlignmentTraceContainer::unique_ptr_type Tptr(new libmaus2::lcs::AlignmentTraceContainer);
-		AATC[i] = UNIQUE_PTR_MOVE(Tptr);
-	}
-
-
-	libmaus2::autoarray::AutoArray<LASToBamContext::unique_ptr_type> Acontexts(numthreads);
-	libmaus2::dazzler::align::RefMapEntryVector refmap;
-	for ( uint64_t i = 0; i < Pbamheader->getNumRef(); ++i )
-		refmap.push_back(libmaus2::dazzler::align::RefMapEntry(i,0));
-	for ( uint64_t i = 0; i < numthreads; ++i )
-	{
-		LASToBamContext::unique_ptr_type Tptr(new LASToBamContext(
-			tspace,true /* mdnm */,
-			e_supstrat,
-			std::string(),refmap));
-		Acontexts[i] = UNIQUE_PTR_MOVE(Tptr);
-	}
-
-	uint64_t const histthres = 64*1024;
-	uint64_t const histmult = histthres + 1;
-	libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> Ahist(numthreads);
-	for ( uint64_t i = 0; i < numthreads; ++i )
-	{
-		libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type thist(new libmaus2::autoarray::AutoArray<uint64_t>(histmult));
-		Ahist[i] = UNIQUE_PTR_MOVE(thist);
-	}
-
-	libmaus2::timing::RealTimeClock accclock;
-	accclock.start();
-
-	uint64_t totalreads = 0;
-
-	libmaus2::parallel::PosixSemaphore finsem;
-
-	for ( uint64_t readpart = 1 ; running; ++readpart )
-	{
-		roundclock.start();
-
-		uint64_t o_name = 0;
-		uint64_t o_data = 0;
-		uint64_t prev_o_name = o_name;
-		uint64_t rlen = 0;
-		bool const termdata = false;
-		bool const mapdata = true;
-		bool const paddata = true;
-		char const padsym = 4;
-		bool havedata = true;
-		uint64_t oo = 0;
-
-		lclock.start();
-		// load read block
-		while ( o_data < maxo && (havedata = LBFA.getNext(Areadnames,o_name,Areaddata,o_data,rlen,termdata,mapdata,paddata,padsym)) )
-		{
-			#if 0
-			std::cerr << data.begin()+o_name << std::endl;
-			std::cerr.write(
-				data.begin() + o_data,
-				rlen
-			);
-			std::cerr.put('\n');
-			#endif
-
-			uint64_t readoffset = o_data - rlen - 2*(paddata ? 1 : 0) + (paddata ? 1 : 0);
-
-			assert ( Areaddata [ readoffset - 1 ] == padsym );
-			assert ( Areaddata [ readoffset + rlen ] == padsym );
-
-			O.push(oo,libmaus2::fastx::LineBufferFastAReader::ReadMeta(prev_o_name,readoffset,rlen));
-			prev_o_name = o_name;
-		}
-
-		uint64_t const numreads = oo;
 		if ( verbose > 1 )
-			std::cerr << "[V] got " << numreads << " reads in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
-
-		std::vector<std::string> readnames;
-		for ( uint64_t i = 0; i < numreads; ++i )
-			readnames.push_back(Areadnames.begin() + O[i].nameoff);
-
-		// set up HITS_DB datastructure for reads
-		uint64_t readmaxlen = 0;
-		uint64_t readtotlen = 0;
-		for ( uint64_t i = 0; i < numreads; ++i )
 		{
-			readmaxlen = std::max(readmaxlen,O[i].len);
-			readtotlen += O[i].len;
+			std::cerr << "[V] physical memory " << MEM_PHYSICAL << std::endl;
+			if ( memlimit )
+				std::cerr << "[V] mem limit " << memlimit << std::endl;
 		}
 
-		#if 0
-		uint64_t const numreadlenbits = readmaxlen ? libmaus2::math::numbits(readmaxlen-1) : 0;
-		uint64_t const numreadlenbytes = (numreadlenbits + 7)/8;
-		#endif
+		std::string const fastaname = arg[0];
+		std::string const combfn = arg.uniqueArgPresent("Q") ? arg["Q"] : (fastaname + ".damapper_bwt");
+		std::string const readsformat = arg.uniqueArgPresent("I") ? arg["I"] : "fasta";
 
-		AREADREADS.ensureSize(numreads + 2);
-		static char readpath[] = "reads.db";
-
-		HITS_DB readsdb;
-		readsdb.ureads = numreads;
-		readsdb.treads = numreads;
-		readsdb.cutoff = -1;
-		// readsdb.all = 0;
-		readsdb.freq[0] = readsdb.freq[1] = readsdb.freq[2] = readsdb.freq[3] = 0.25;
-		readsdb.maxlen = readmaxlen;
-		readsdb.totlen = readtotlen;
-		readsdb.nreads = numreads;
-		readsdb.trimmed = 1;
-		readsdb.part = readpart;
-		readsdb.ufirst = 0;
-		readsdb.tfirst = 0;
-		readsdb.path = &readpath[0];
-		readsdb.loaded = 1;
-		readsdb.bases = Areaddata.begin();
-		readsdb.reads = AREADREADS.begin() + 1;
-		readsdb.tracks = NULL;
-
-		for ( uint64_t i = 0; i < numreads; ++i )
+		if (
+			(! libmaus2::util::GetFileSize::fileExists(combfn))
+			||
+			libmaus2::util::GetFileSize::isOlder(combfn,fastaname)
+		)
 		{
-			readsdb.reads[i].origin = i;
-			readsdb.reads[i].rlen = O[i].len;
-			readsdb.reads[i].fpulse = 0;
-			readsdb.reads[i].boff = O[i].dataoff;
-			readsdb.reads[i].coff = -1;
-			readsdb.reads[i].flags = DB_BEST;
+			DNAIndexBuild forwindex;
+			DNAIndexBuild rcindex;
+
+			std::string const tmpprefix = arg.uniqueArgPresent("T") ? arg["T"] : libmaus2::util::ArgInfo::getDefaultTmpFileName(arg.progname);
+			std::string const indexcreatefn = tmpprefix + "_damapper_bwt_index_create";
+			libmaus2::util::TempFileRemovalContainer::addTempFile(indexcreatefn);
+
+			libmaus2::aio::OutputStreamInstance::unique_ptr_type combOSI(new libmaus2::aio::OutputStreamInstance(indexcreatefn));
+			forwindex.setupFromFasta(fastaname,tmpprefix,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,*combOSI);
+			rcindex.setupFromForwardCompact(fastaname,tmpprefix,forwindex.fainame,forwindex.compactname,forwindex.metaname,forwindex.replname,verbose,constrsasamplingrate,iconstrsasamplingrate,bwtconstrmem,numthreads,*combOSI);
+
+			std::string const m5info = tmpprefix+".m5infos";
+			libmaus2::aio::InputStreamInstance ISI(fastaname);
+			libmaus2::fastx::FastAStreamSet FASS(ISI);
+			std::map<std::string,std::string> m5map = FASS.computeMD5(false,false);
+
+			libmaus2::util::NumberSerialisation::serialiseNumber(*combOSI,m5map.size());
+			for ( std::map<std::string,std::string>::const_iterator ita = m5map.begin(); ita != m5map.end(); ++ita )
+			{
+				libmaus2::util::StringSerialisation::serialiseString(*combOSI,ita->first);
+				libmaus2::util::StringSerialisation::serialiseString(*combOSI,ita->second);
+			}
+
+			combOSI->flush();
+			combOSI.reset();
+
+			forwindex.cleanup();
+			rcindex.cleanup();
+
+			// rename
+			libmaus2::aio::OutputStreamFactoryContainer::rename(indexcreatefn,combfn);
 		}
 
-		(reinterpret_cast<int*>(readsdb.reads))[-1] = numreads;
-		(reinterpret_cast<int*>(readsdb.reads))[-2] = numreads;
+		DNAIndex forwindex;
+		DNAIndex rcindex;
 
-		// number of non empty intervals per read
-		#if 0
-		RI.ensureSize(numreads);
-		RS.ensureSize(numreads+1);
-		RSN.ensureSize(numreads+1);
-		RSE.ensureSize(numreads+1);
+		libmaus2::aio::InputStreamInstance::unique_ptr_type combISI(new libmaus2::aio::InputStreamInstance(combfn));
+		forwindex.loadFromSingleForward(*combISI,numthreads,cache_k,verbose);
+		rcindex.loadFromSingleReverseComplement(*combISI,numthreads,cache_k,verbose);
+
+		std::map<std::string,std::string> m5map;
+		uint64_t const sm5 = libmaus2::util::NumberSerialisation::deserialiseNumber(*combISI);
+		for ( uint64_t i = 0; i < sm5; ++i )
+		{
+			std::string const key = libmaus2::util::StringSerialisation::deserialiseString(*combISI);
+			std::string const value = libmaus2::util::StringSerialisation::deserialiseString(*combISI);
+			m5map[key] = value;
+		}
+
+		combISI.reset();
+
+
+		std::vector < DNAIndex * > indexes;
+		indexes.push_back(&forwindex);
+		indexes.push_back(&rcindex);
+
+		float freq[4] = { 0.25, 0.25, 0.25, 0.25 };
+		int64_t const tspace = 100;
+		Align_Spec * aspec = New_Align_Spec(0.85, tspace, &freq[0]);
+		Set_Filter_Params(k, 0, numthreads);
+
+		libmaus2::fastx::LineBufferFastAReader::unique_ptr_type LBFA;
+		libmaus2::bambam::BamAlignmentDecoderWrapper::unique_ptr_type BAD;
+
+		if ( readsformat == "fasta" )
+		{
+			libmaus2::fastx::LineBufferFastAReader::unique_ptr_type TLBFA(new libmaus2::fastx::LineBufferFastAReader(std::cin));
+			LBFA = UNIQUE_PTR_MOVE(TLBFA);
+		}
+		else if ( readsformat == "bam" )
+		{
+			libmaus2::bambam::BamAlignmentDecoderWrapper::unique_ptr_type TBAD(libmaus2::bambam::BamAlignmentDecoderFactory::construct());
+			BAD = UNIQUE_PTR_MOVE(TBAD);
+		}
+		else
+		{
+			libmaus2::exception::LibMausException lme;
+			lme.getStream() << "[E] unsupported input format " << readsformat << std::endl;
+			lme.finish();
+			throw lme;
+		}
+
+		libmaus2::bambam::BamHeader const * inheader = BAD ? (&(BAD->getDecoder().getHeader())) : 0;
+
+		bool running = true;
+
+		libmaus2::timing::RealTimeClock roundclock;
+		libmaus2::timing::RealTimeClock lclock;
+
+		// read names
+		libmaus2::autoarray::AutoArray<char> Areadnames;
+		// read base data
+		libmaus2::autoarray::AutoArray<char> Areaddata;
+		// BAM data (if any)
+		libmaus2::autoarray::AutoArray<uint8_t> Abam;
+		// read meta data
+		libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > O;
+		// bam meta data
+		libmaus2::autoarray::AutoArray< uint64_t > Obam;
+
+		uint64_t const refnumposbytes = forwindex.getNumPosBytes();
+		uint64_t const refnumseqbytes = forwindex.getNumSeqBytes();
+		uint64_t const numkeybits = 2*k;
+		uint64_t const numkeybytes = (numkeybits + 7)/8;
+
+		std::vector<unsigned int> qfullkeybytes;
+		#if defined(LIBMAUS2_BYTE_ORDER_LITTLE_ENDIAN)
+		// position in sequence
+		for ( unsigned int i = 0; i < refnumposbytes; ++i )
+			qfullkeybytes.push_back(sizeof(uint64_t)+i);
+		// sequence id
+		for ( unsigned int i = 0; i < refnumseqbytes; ++i )
+			qfullkeybytes.push_back(sizeof(uint64_t)+sizeof(uint32_t)+i);
+		// code
+		for ( unsigned int i = 0; i < numkeybytes; ++i )
+			qfullkeybytes.push_back(i);
+		#else
+		#error "Unsupported byte order"
 		#endif
 
-		uint64_t const readsperpack = (numreads + tnumpacks - 1)/tnumpacks;
-		uint64_t const numpacks = readsperpack ? (numreads + readsperpack - 1)/readsperpack : 0;
-		assert ( numpacks <= tnumpacks );
+		uint64_t const packsperthread = 32;
+		uint64_t const tnumpacks = packsperthread*numthreads;
 
-		struct KmerPos
+		// query intervals on suffix array (divided into packages)
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < RefKMer >::unique_ptr_type > RKM(tnumpacks);
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray < QueryKMer >::unique_ptr_type > QKM(tnumpacks);
+
+		libmaus2::autoarray::AutoArray< uint64_t > NUMRK(tnumpacks+1);
+		libmaus2::autoarray::AutoArray< uint64_t > NUMQK(tnumpacks+1);
+		libmaus2::autoarray::AutoArray< uint64_t > NUMRV(tnumpacks+1);
+
+		// ref db read array
+		libmaus2::autoarray::AutoArray< HITS_READ > AREFHITREADS;
+		libmaus2::autoarray::AutoArray< HITS_READ > AREADREADS;
+		HITS_DB refdb;
+
+		for ( uint64_t i = 0; i < RKM.size(); ++i )
 		{
-			// kmer code
-			uint64_t code;
-			// position in read
-			int32_t rpos;
-			// read id
-			int32_t read;
-		};
-
-		uint64_t indexyield = 0;
-
-		for ( uint64_t index_i = 0; index_i < indexes.size(); ++index_i )
+			libmaus2::autoarray::AutoArray < RefKMer >::unique_ptr_type tptr(new libmaus2::autoarray::AutoArray < RefKMer >);
+			RKM[i] = UNIQUE_PTR_MOVE(tptr);
+		}
+		for ( uint64_t i = 0; i < QKM.size(); ++i )
 		{
-			DNAIndex & index = *indexes[index_i];
+			libmaus2::autoarray::AutoArray < QueryKMer >::unique_ptr_type tptr(new libmaus2::autoarray::AutoArray < QueryKMer >);
+			QKM[i] = UNIQUE_PTR_MOVE(tptr);
+		}
 
-			// #define IDEBUG
-			#if defined(IDEBUG)
-			libmaus2::bitio::CompactArray::unique_ptr_type CTEXT(index.loadText());
-			#endif
+		libmaus2::autoarray::AutoArray < RefKMer > GRKM;
+		libmaus2::autoarray::AutoArray < RefKMer > TGRKM;
+		libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > GQKM;
+		libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > TGQKM;
+		libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > GRQKM;
+		libmaus2::autoarray::AutoArray < QueryKMer, libmaus2::autoarray::alloc_type_c > TGRQKM;
 
-			// search kmers
+		// key bytes for code sorting
+		std::vector<unsigned int> keybytes;
+		#if defined(LIBMAUS2_BYTE_ORDER_LITTLE_ENDIAN)
+		for ( uint64_t i = 0; i < numkeybytes; ++i )
+			keybytes.push_back(i);
+		#elif defined(LIBMAUS2_BYTE_ORDER_BIG_ENDIAN)
+		for ( uint64_t i = 0; i < numkeybytes; ++i )
+			keybytes.push_back(sizeof(uint64_t) - i - 1);
+		#else
+		#error "Unknown byte order"
+		#endif
+
+		// invalid query kmer
+		QueryKMer QIff;
+		QIff.code = std::numeric_limits<uint64_t>::max();
+		QIff.rpos = std::numeric_limits<uint32_t>::max();
+		QIff.readid = std::numeric_limits<uint32_t>::max();
+		QueryKMer QI0;
+		QI0.code = 0;
+		QI0.rpos = std::numeric_limits<uint32_t>::max();
+		QI0.readid = std::numeric_limits<uint32_t>::max();
+
+		libmaus2::bambam::BamHeader::unique_ptr_type Pbamheader(forwindex.getBamHeader(m5map,fastaname,inheader,arg));
+		libmaus2::lz::BgzfDeflate<std::ostream>::unique_ptr_type bgzfout(new libmaus2::lz::BgzfDeflate<std::ostream>(std::cout,level));
+		Pbamheader->serialise(*bgzfout);
+		bgzfout->flush();
+
+		AlignerAllocator alignalloc;
+		libmaus2::autoarray::AutoArray< libmaus2::lcs::Aligner::shared_ptr_type > Aaligners(numthreads);
+		for ( uint64_t i = 0; i < Aaligners.size(); ++i )
+		{
+			libmaus2::lcs::Aligner::shared_ptr_type Paligner = alignalloc();
+			Aaligners[i] = Paligner;
+		}
+
+		libmaus2::autoarray::AutoArray< libmaus2::lcs::AlignmentTraceContainer::unique_ptr_type > AATC(numthreads);
+		for ( uint64_t i = 0; i < AATC.size(); ++i )
+		{
+			libmaus2::lcs::AlignmentTraceContainer::unique_ptr_type Tptr(new libmaus2::lcs::AlignmentTraceContainer);
+			AATC[i] = UNIQUE_PTR_MOVE(Tptr);
+		}
+
+
+		libmaus2::autoarray::AutoArray<LASToBamContext::unique_ptr_type> Acontexts(numthreads);
+		libmaus2::dazzler::align::RefMapEntryVector refmap;
+		for ( uint64_t i = 0; i < Pbamheader->getNumRef(); ++i )
+			refmap.push_back(libmaus2::dazzler::align::RefMapEntry(i,0));
+		for ( uint64_t i = 0; i < numthreads; ++i )
+		{
+			LASToBamContext::unique_ptr_type Tptr(new LASToBamContext(
+				tspace,true /* mdnm */,
+				e_supstrat,
+				std::string(),refmap));
+			Acontexts[i] = UNIQUE_PTR_MOVE(Tptr);
+		}
+
+		uint64_t const histthres = 64*1024;
+		uint64_t const histmult = histthres + 1;
+		libmaus2::autoarray::AutoArray< libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type> Ahist(numthreads);
+		for ( uint64_t i = 0; i < numthreads; ++i )
+		{
+			libmaus2::autoarray::AutoArray<uint64_t>::unique_ptr_type thist(new libmaus2::autoarray::AutoArray<uint64_t>(histmult));
+			Ahist[i] = UNIQUE_PTR_MOVE(thist);
+		}
+
+		libmaus2::timing::RealTimeClock accclock;
+		accclock.start();
+
+		uint64_t totalreads = 0;
+
+		libmaus2::parallel::PosixSemaphore finsem;
+
+		for ( uint64_t readpart = 1 ; running; ++readpart )
+		{
+			roundclock.start();
+
+			uint64_t o_name = 0;
+			uint64_t o_data = 0;
+			uint64_t prev_o_name = o_name;
+			uint64_t rlen = 0;
+			bool const termdata = false;
+			bool const mapdata = true;
+			bool const paddata = true;
+			char const padsym = 4;
+			bool havedata = true;
+			uint64_t oo = 0;
+			uint64_t oobam = 0;
+
 			lclock.start();
-			std::vector < GenericWorkPackage<PackageSearchKmers> > VSAR(numpacks);
-			for ( uint64_t t = 0; t < numpacks; ++t )
+			if ( LBFA )
 			{
-				VSAR[t] = GenericWorkPackage<PackageSearchKmers>(0,SearchKmersDispatcher_id,PackageSearchKmers(t,readsperpack,numreads,k,&RKM,&QKM,&Areaddata,&O,&NUMRK,&NUMQK,&index,&finsem));
-				STP.enque(&VSAR[t]);
+				// load read block
+				while ( o_data < maxo && (havedata = LBFA->getNext(Areadnames,o_name,Areaddata,o_data,rlen,termdata,mapdata,paddata,padsym)) )
+				{
+					#if 0
+					std::cerr << data.begin()+o_name << std::endl;
+					std::cerr.write(
+						data.begin() + o_data,
+						rlen
+					);
+					std::cerr.put('\n');
+					#endif
+
+					uint64_t readoffset = o_data - rlen - 2*(paddata ? 1 : 0) + (paddata ? 1 : 0);
+
+					assert ( Areaddata [ readoffset - 1 ] == padsym );
+					assert ( Areaddata [ readoffset + rlen ] == padsym );
+
+					O.push(oo,libmaus2::fastx::LineBufferFastAReader::ReadMeta(prev_o_name,readoffset,rlen));
+					prev_o_name = o_name;
+				}
 			}
-			semWait(finsem,numpacks);
-			if ( verbose > 1 )
-				std::cerr << "[V] computed SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
-
-			// concatenate reference kmer sequences
-			lclock.start();
-			libmaus2::util::PrefixSums::prefixSums(NUMRK.begin(),NUMRK.begin()+numpacks+1);
-			GRKM.ensureSize(NUMRK[numpacks]);
-
-			std::vector < GenericWorkPackage<PackageConcatSA> > VCSAD(numpacks);
-			for ( uint64_t t = 0; t < numpacks; ++t )
+			else if ( BAD )
 			{
-				VCSAD[t] = GenericWorkPackage<PackageConcatSA>(0,ConcatSADispatcher_id,PackageConcatSA(t,&GRKM,&NUMRK,&RKM,&finsem));
-				STP.enque(&VCSAD[t]);
-			}
-			semWait(finsem,numpacks);
-			if ( verbose > 1 )
-				std::cerr << "[V] concatenated SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+				libmaus2::bambam::BamAlignmentDecoder & decoder = BAD->getDecoder();
+				libmaus2::bambam::BamAlignment const & algn = decoder.getAlignment();
+				uint64_t o_bam = 0;
 
-			// sort suffix ranges by code field (so we can unify the ranges)
-			lclock.start();
-			TGRKM.ensureSize(NUMRK[numpacks]);
-			libmaus2::sorting::InterleavedRadixSort::byteradixsortKeyBytes(
-				GRKM.begin(),GRKM.begin()+NUMRK[numpacks],
-				TGRKM.begin(),TGRKM.begin()+NUMRK[numpacks],
-				numthreads,
-				keybytes.begin(),numkeybytes,STP);
+				while ( o_data < maxo && (havedata=decoder.readAlignment()) )
+				{
+					char const * cname = algn.getName();
+					uint64_t const lname = algn.getLReadName();
+					uint64_t const rlen = algn.getLseq();
+					assert ( strlen(cname)+1 == lname );
+
+					Areadnames.ensureSize(o_name + lname);
+					std::copy(cname,cname+lname,Areadnames.begin() + o_name);
+
+					Areaddata.ensureSize(o_data + 2 + rlen);
+					Areaddata [ o_data ] = padsym;
+					Areaddata [ o_data + rlen + 1 ] = padsym;
+					algn.decodeRead(Areaddata.begin() + o_data + 1, rlen);
+
+					for ( uint64_t i = 0; i < rlen; ++i )
+						Areaddata [ o_data + 1 + i ] = libmaus2::fastx::mapChar(Areaddata [ o_data + 1 + i ]);
+
+					uint64_t const readoffset = o_data + 1;
+
+					assert ( Areaddata [ readoffset - 1 ] == padsym );
+					assert ( Areaddata [ readoffset + rlen ] == padsym );
+
+					Abam.ensureSize(o_bam + algn.blocksize);
+					std::copy(
+						algn.D.begin(),
+						algn.D.begin()+algn.blocksize,
+						Abam.begin() + o_bam
+					);
+
+					O.push(oo,libmaus2::fastx::LineBufferFastAReader::ReadMeta(o_name,readoffset,rlen));
+					Obam.push(oobam,o_bam);
+
+					o_name += lname;
+					o_data += rlen + 2;
+					o_bam += algn.blocksize;
+				}
+				Obam.push(oobam,o_bam);
+			}
+
+			uint64_t const numreads = oo;
 			if ( verbose > 1 )
-				std::cerr << "[V] sorted concatenated SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
-			if ( numkeybytes % 2 == 1 )
-				std::swap(GRKM,TGRKM);
+				std::cerr << "[V] got " << numreads << " reads in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+
+			std::vector<std::string> readnames;
+			for ( uint64_t i = 0; i < numreads; ++i )
+				readnames.push_back(Areadnames.begin() + O[i].nameoff);
+
+			// set up HITS_DB datastructure for reads
+			uint64_t readmaxlen = 0;
+			uint64_t readtotlen = 0;
+			for ( uint64_t i = 0; i < numreads; ++i )
+			{
+				readmaxlen = std::max(readmaxlen,O[i].len);
+				readtotlen += O[i].len;
+			}
 
 			#if 0
-			for ( uint64_t i = 1; i < NUMRK[numpacks]; ++i )
-				assert ( GRKM[i-1].code <= GRKM[i].code );
+			uint64_t const numreadlenbits = readmaxlen ? libmaus2::math::numbits(readmaxlen-1) : 0;
+			uint64_t const numreadlenbytes = (numreadlenbits + 7)/8;
 			#endif
 
-			lclock.start();
-			// look for code bounds
-			std::vector<uint64_t> ubounds;
-			uint64_t const upacksize = (NUMRK[numpacks] + numthreads - 1)/numthreads;
-			uint64_t ulow = 0;
-			while ( ulow < NUMRK[numpacks] )
+			AREADREADS.ensureSize(numreads + 2);
+			static char readpath[] = "reads.db";
+
+			HITS_DB readsdb;
+			readsdb.ureads = numreads;
+			readsdb.treads = numreads;
+			readsdb.cutoff = -1;
+			// readsdb.all = 0;
+			readsdb.freq[0] = readsdb.freq[1] = readsdb.freq[2] = readsdb.freq[3] = 0.25;
+			readsdb.maxlen = readmaxlen;
+			readsdb.totlen = readtotlen;
+			readsdb.nreads = numreads;
+			readsdb.trimmed = 1;
+			readsdb.part = readpart;
+			readsdb.ufirst = 0;
+			readsdb.tfirst = 0;
+			readsdb.path = &readpath[0];
+			readsdb.loaded = 1;
+			readsdb.bases = Areaddata.begin();
+			readsdb.reads = AREADREADS.begin() + 1;
+			readsdb.tracks = NULL;
+
+			for ( uint64_t i = 0; i < numreads; ++i )
 			{
+				readsdb.reads[i].origin = i;
+				readsdb.reads[i].rlen = O[i].len;
+				readsdb.reads[i].fpulse = 0;
+				readsdb.reads[i].boff = O[i].dataoff;
+				readsdb.reads[i].coff = -1;
+				readsdb.reads[i].flags = DB_BEST;
+			}
+
+			(reinterpret_cast<int*>(readsdb.reads))[-1] = numreads;
+			(reinterpret_cast<int*>(readsdb.reads))[-2] = numreads;
+
+			// number of non empty intervals per read
+			#if 0
+			RI.ensureSize(numreads);
+			RS.ensureSize(numreads+1);
+			RSN.ensureSize(numreads+1);
+			RSE.ensureSize(numreads+1);
+			#endif
+
+			uint64_t const readsperpack = (numreads + tnumpacks - 1)/tnumpacks;
+			uint64_t const numpacks = readsperpack ? (numreads + readsperpack - 1)/readsperpack : 0;
+			assert ( numpacks <= tnumpacks );
+
+			struct KmerPos
+			{
+				// kmer code
+				uint64_t code;
+				// position in read
+				int32_t rpos;
+				// read id
+				int32_t read;
+			};
+
+			uint64_t indexyield = 0;
+
+			for ( uint64_t index_i = 0; index_i < indexes.size(); ++index_i )
+			{
+				DNAIndex & index = *indexes[index_i];
+
+				// #define IDEBUG
+				#if defined(IDEBUG)
+				libmaus2::bitio::CompactArray::unique_ptr_type CTEXT(index.loadText());
+				#endif
+
+				// search kmers
+				lclock.start();
+				std::vector < GenericWorkPackage<PackageSearchKmers> > VSAR(numpacks);
+				for ( uint64_t t = 0; t < numpacks; ++t )
+				{
+					VSAR[t] = GenericWorkPackage<PackageSearchKmers>(0,SearchKmersDispatcher_id,PackageSearchKmers(t,readsperpack,numreads,k,&RKM,&QKM,&Areaddata,&O,&NUMRK,&NUMQK,&index,&finsem));
+					STP.enque(&VSAR[t]);
+				}
+				semWait(finsem,numpacks);
+				if ( verbose > 1 )
+					std::cerr << "[V] computed SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+
+				// concatenate reference kmer sequences
+				lclock.start();
+				libmaus2::util::PrefixSums::prefixSums(NUMRK.begin(),NUMRK.begin()+numpacks+1);
+				GRKM.ensureSize(NUMRK[numpacks]);
+
+				std::vector < GenericWorkPackage<PackageConcatSA> > VCSAD(numpacks);
+				for ( uint64_t t = 0; t < numpacks; ++t )
+				{
+					VCSAD[t] = GenericWorkPackage<PackageConcatSA>(0,ConcatSADispatcher_id,PackageConcatSA(t,&GRKM,&NUMRK,&RKM,&finsem));
+					STP.enque(&VCSAD[t]);
+				}
+				semWait(finsem,numpacks);
+				if ( verbose > 1 )
+					std::cerr << "[V] concatenated SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+
+				// sort suffix ranges by code field (so we can unify the ranges)
+				lclock.start();
+				TGRKM.ensureSize(NUMRK[numpacks]);
+				libmaus2::sorting::InterleavedRadixSort::byteradixsortKeyBytes(
+					GRKM.begin(),GRKM.begin()+NUMRK[numpacks],
+					TGRKM.begin(),TGRKM.begin()+NUMRK[numpacks],
+					numthreads,
+					keybytes.begin(),numkeybytes,STP);
+				if ( verbose > 1 )
+					std::cerr << "[V] sorted concatenated SA ranges in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+				if ( numkeybytes % 2 == 1 )
+					std::swap(GRKM,TGRKM);
+
+				#if 0
+				for ( uint64_t i = 1; i < NUMRK[numpacks]; ++i )
+					assert ( GRKM[i-1].code <= GRKM[i].code );
+				#endif
+
+				lclock.start();
+				// look for code bounds
+				std::vector<uint64_t> ubounds;
+				uint64_t const upacksize = (NUMRK[numpacks] + numthreads - 1)/numthreads;
+				uint64_t ulow = 0;
+				while ( ulow < NUMRK[numpacks] )
+				{
+					ubounds.push_back(ulow);
+					uint64_t uhigh = std::min(NUMRK[numpacks],ulow+upacksize);
+					while ( uhigh+1 < NUMRK[numpacks] && GRKM[uhigh].code == GRKM[uhigh-1].code )
+						++uhigh;
+
+					ulow = uhigh;
+				}
 				ubounds.push_back(ulow);
-				uint64_t uhigh = std::min(NUMRK[numpacks],ulow+upacksize);
-				while ( uhigh+1 < NUMRK[numpacks] && GRKM[uhigh].code == GRKM[uhigh-1].code )
-					++uhigh;
+				assert ( ulow == NUMRK[numpacks] );
 
-				ulow = uhigh;
-			}
-			ubounds.push_back(ulow);
-			assert ( ulow == NUMRK[numpacks] );
+				// check bounds
+				for ( uint64_t i = 0; i < ubounds.size(); ++i )
+					assert ( i == 0 || (i+1)==ubounds.size() || GRKM[ubounds[i]-1].code != GRKM[ubounds[i]].code );
 
-			// check bounds
-			for ( uint64_t i = 0; i < ubounds.size(); ++i )
-				assert ( i == 0 || (i+1)==ubounds.size() || GRKM[ubounds[i]-1].code != GRKM[ubounds[i]].code );
-
-			std::vector < GenericWorkPackage<PackageFillHist> > VPFH(numthreads);
-			for ( uint64_t t = 0; t < numthreads; ++t )
-			{
-				VPFH[t] = GenericWorkPackage<PackageFillHist>(0,FillHistDispatcher_id,PackageFillHist(t,&Ahist,&finsem));
-				STP.enque(&VPFH[t]);
-			}
-			semWait(finsem,numthreads);
-
-			// unified package sizes
-			std::vector<uint64_t> usize(ubounds.size());
-			uint64_t const numuni = ubounds.size() ? (ubounds.size()-1) : 0;
-			std::vector < GenericWorkPackage<PackageUnifyPackageSizes> > VUPS(numuni);
-			for ( uint64_t t = 1; t < ubounds.size(); ++t )
-			{
-				VUPS[t-1] = GenericWorkPackage<PackageUnifyPackageSizes>(0,UnifyPackageSizesDispatcher_id,PackageUnifyPackageSizes(t,&Ahist,&GRKM,&ubounds,&usize,histthres,&finsem));
-				STP.enque(&VUPS[t-1]);
-			}
-			semWait(finsem,numuni);
-			// compute prefix sums
-			libmaus2::util::PrefixSums::prefixSums(usize.begin(),usize.end());
-
-			// merge histograms
-			uint64_t const tperthread = (histmult + numthreads - 1)/numthreads;
-			std::vector < GenericWorkPackage < PackageMergeHistograms > > VPMH(numthreads);
-			for ( uint64_t t = 0; t < numthreads; ++t )
-			{
-				VPMH[t] = GenericWorkPackage < PackageMergeHistograms >(0,MergeHistogramsDispatcher_id,PackageMergeHistograms(t,tperthread,histmult,numthreads,&Ahist,&finsem));
-				STP.enque(&VPMH[t]);
-			}
-			semWait(finsem,numthreads);
-
-			#if 0
-			for ( uint64_t i = 0; i < histmult; ++i )
-				if ( (*(Ahist[0]))[i] )
+				std::vector < GenericWorkPackage<PackageFillHist> > VPFH(numthreads);
+				for ( uint64_t t = 0; t < numthreads; ++t )
 				{
-					std::cerr << "[H] " << i << " " << (*(Ahist[0]))[i] << std::endl;
+					VPFH[t] = GenericWorkPackage<PackageFillHist>(0,FillHistDispatcher_id,PackageFillHist(t,&Ahist,&finsem));
+					STP.enque(&VPFH[t]);
 				}
-			#endif
+				semWait(finsem,numthreads);
 
-			// concatenate unique
-			uint64_t volatile gc = 0;
-			libmaus2::parallel::PosixSpinLock gclock;
-			uint64_t const numus = usize.size() ? (usize.size()-1) : 0;
-			std::vector < GenericWorkPackage < PackageConcatenateUnique > > VPCU(numus);
-			for ( uint64_t t = 1; t < usize.size(); ++t )
-			{
-				VPCU[t-1] = GenericWorkPackage < PackageConcatenateUnique >(0,ConcatenateUniqueDispatcher_id,PackageConcatenateUnique(t,&GRKM,&TGRKM,&ubounds,&usize,&gclock,&gc,&finsem));
-				STP.enque(&VPCU[t-1]);
-			}
-			semWait(finsem,numus);
-			GRKM.swap(TGRKM);
-			if ( verbose > 1 )
-				std::cerr << "[V] uniquified in time " << lclock.formatTime(lclock.getElapsedSeconds()) << " num out " << usize.back() << " sum " << gc << std::endl;
-
-			lclock.start();
-			libmaus2::autoarray::AutoArray<uint64_t,libmaus2::autoarray::alloc_type_c> PP(usize.back()+1,false);
-			uint64_t const supacksize = (usize.back() + numthreads - 1)/numthreads;
-			uint64_t const suthreads = supacksize ? ((usize.back() + supacksize - 1) /supacksize) : 0;
-			PP[0] = 0;
-
-			std::vector < GenericWorkPackage < PackageSumIntervals > > VSI(suthreads);
-			for ( uint64_t t = 0; t < suthreads; ++t )
-			{
-				VSI[t] = GenericWorkPackage < PackageSumIntervals >(0,SumIntervalsDispatcher_id,PackageSumIntervals(t,supacksize,&usize,&GRKM,&PP,&finsem));
-				STP.enque(&VSI[t]);
-			}
-			semWait(finsem,suthreads);
-
-			for ( uint64_t t = 0; t < suthreads; ++t )
-			{
-				uint64_t const ulow = t * supacksize;
-				uint64_t const uhigh = std::min(ulow+supacksize,usize.back());
-				assert ( uhigh != ulow );
-
-				PP[uhigh] += PP[ulow];
-			}
-
-			std::vector < GenericWorkPackage < PackagePrefixSums > > VPPS(suthreads);
-			for ( uint64_t t = 0; t < suthreads; ++t )
-			{
-				VPPS[t] = GenericWorkPackage < PackagePrefixSums >(0,PrefixSumsDispatcher_id,PackagePrefixSums(t,supacksize,&usize,&GRKM,&PP,&finsem));
-				STP.enque(&VPPS[t]);
-			}
-			semWait(finsem,suthreads);
-
-			std::vector<uint64_t> uranges;
-			std::vector<uint64_t> urefk;
-			uint64_t const uspan = (PP[usize.back()] + numthreads - 1)/numthreads;
-
-			for ( uint64_t i = 0; i < numthreads; ++i )
-			{
-				uint64_t const utarget = i * uspan;
-				uint64_t const * pp = std::lower_bound(PP.begin(),PP.begin()+usize.back(),utarget);
-				uranges.push_back(pp-PP.begin());
-				urefk.push_back(*pp);
-			}
-			uranges.push_back(usize.back());
-			urefk.push_back(PP[usize.back()]);
-			assert ( uranges[0] == 0 );
-
-			#if 0
-			for ( uint64_t i = 0; i < uranges.size(); ++i )
-			{
-				std::cerr << "uranges[.]=" << uranges[i]
-					<< ((i > 0) ? (uranges[i]-uranges[i-1]) : 0)
-					<< std::endl;
-			}
-			#endif
-
-			#if 0
-			{
-				uint64_t s = 0;
-				for ( uint64_t i = 0; i < usize.back(); ++i )
+				// unified package sizes
+				std::vector<uint64_t> usize(ubounds.size());
+				uint64_t const numuni = ubounds.size() ? (ubounds.size()-1) : 0;
+				std::vector < GenericWorkPackage<PackageUnifyPackageSizes> > VUPS(numuni);
+				for ( uint64_t t = 1; t < ubounds.size(); ++t )
 				{
-					assert ( PP[i] == s );
-					s += GRKM[i].high-GRKM[i].low;
+					VUPS[t-1] = GenericWorkPackage<PackageUnifyPackageSizes>(0,UnifyPackageSizesDispatcher_id,PackageUnifyPackageSizes(t,&Ahist,&GRKM,&ubounds,&usize,histthres,&finsem));
+					STP.enque(&VUPS[t-1]);
 				}
-				assert ( PP[usize.back()] == s );
-			}
-			#endif
+				semWait(finsem,numuni);
+				// compute prefix sums
+				libmaus2::util::PrefixSums::prefixSums(usize.begin(),usize.end());
 
-			PP.release();
-			if ( verbose > 1 )
-				std::cerr << "[V] computed range prefix sums in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+				// merge histograms
+				uint64_t const tperthread = (histmult + numthreads - 1)/numthreads;
+				std::vector < GenericWorkPackage < PackageMergeHistograms > > VPMH(numthreads);
+				for ( uint64_t t = 0; t < numthreads; ++t )
+				{
+					VPMH[t] = GenericWorkPackage < PackageMergeHistograms >(0,MergeHistogramsDispatcher_id,PackageMergeHistograms(t,tperthread,histmult,numthreads,&Ahist,&finsem));
+					STP.enque(&VPMH[t]);
+				}
+				semWait(finsem,numthreads);
 
-			// lookup positions for ranks on suffix array
-			lclock.start();
-			GRQKM.ensureSize(gc);
-			std::vector<uint64_t> NUMREFKVALID(uranges.size());
-			uint64_t const numlsa = uranges.size() ? (uranges.size()-1) : 0;
-			std::vector < GenericWorkPackage < PackageLookupSA > > VLSA(numlsa);
-			for ( uint64_t t = 1; t < uranges.size(); ++t )
-			{
-				VLSA[t-1] = GenericWorkPackage < PackageLookupSA >(0,LookupSADispatcher_id,PackageLookupSA(t,k,&GRKM,&GRQKM,&uranges,&urefk,&NUMREFKVALID,&index,&finsem));
-				STP.enque(&VLSA[t-1]);
-			}
-			semWait(finsem,numlsa);
+				#if 0
+				for ( uint64_t i = 0; i < histmult; ++i )
+					if ( (*(Ahist[0]))[i] )
+					{
+						std::cerr << "[H] " << i << " " << (*(Ahist[0]))[i] << std::endl;
+					}
+				#endif
 
-			// concatenate
-			libmaus2::util::PrefixSums::prefixSums(NUMREFKVALID.begin(),NUMREFKVALID.end());
-			TGRQKM.ensureSize(NUMREFKVALID.back()+2);
-			uint64_t const numcomp = uranges.size() ? (uranges.size()-1) : 0;
-			std::vector < GenericWorkPackage < PackageCompactPos > > VCO(numcomp);
-			for ( uint64_t t = 1; t < uranges.size(); ++t )
-			{
-				VCO[t-1] = GenericWorkPackage < PackageCompactPos >(0,CompactPosDispatcher_id,PackageCompactPos(t,&GRQKM,&TGRQKM,&NUMREFKVALID,&urefk,&finsem));
-				STP.enque(&VCO[t-1]);
-			}
-			semWait(finsem,numcomp);
-			GRQKM.swap(TGRQKM);
+				// concatenate unique
+				uint64_t volatile gc = 0;
+				libmaus2::parallel::PosixSpinLock gclock;
+				uint64_t const numus = usize.size() ? (usize.size()-1) : 0;
+				std::vector < GenericWorkPackage < PackageConcatenateUnique > > VPCU(numus);
+				for ( uint64_t t = 1; t < usize.size(); ++t )
+				{
+					VPCU[t-1] = GenericWorkPackage < PackageConcatenateUnique >(0,ConcatenateUniqueDispatcher_id,PackageConcatenateUnique(t,&GRKM,&TGRKM,&ubounds,&usize,&gclock,&gc,&finsem));
+					STP.enque(&VPCU[t-1]);
+				}
+				semWait(finsem,numus);
+				GRKM.swap(TGRKM);
+				if ( verbose > 1 )
+					std::cerr << "[V] uniquified in time " << lclock.formatTime(lclock.getElapsedSeconds()) << " num out " << usize.back() << " sum " << gc << std::endl;
 
-			assert ( NUMREFKVALID.size() );
-			assert ( GRQKM.size() >= NUMREFKVALID.back() );
-			assert ( TGRQKM.size() >= NUMREFKVALID.back() );
+				lclock.start();
+				libmaus2::autoarray::AutoArray<uint64_t,libmaus2::autoarray::alloc_type_c> PP(usize.back()+1,false);
+				uint64_t const supacksize = (usize.back() + numthreads - 1)/numthreads;
+				uint64_t const suthreads = supacksize ? ((usize.back() + supacksize - 1) /supacksize) : 0;
+				PP[0] = 0;
 
-			// sort
-			libmaus2::sorting::InterleavedRadixSort::byteradixsortKeyBytes(
-				GRQKM.begin(),GRQKM.begin()+NUMREFKVALID.back(),
-				TGRQKM.begin(),TGRQKM.begin()+NUMREFKVALID.back(),
-				numthreads,
-				qfullkeybytes.begin(),qfullkeybytes.size(),STP
-			);
-			if ( qfullkeybytes.size() % 2 != 0 )
+				std::vector < GenericWorkPackage < PackageSumIntervals > > VSI(suthreads);
+				for ( uint64_t t = 0; t < suthreads; ++t )
+				{
+					VSI[t] = GenericWorkPackage < PackageSumIntervals >(0,SumIntervalsDispatcher_id,PackageSumIntervals(t,supacksize,&usize,&GRKM,&PP,&finsem));
+					STP.enque(&VSI[t]);
+				}
+				semWait(finsem,suthreads);
+
+				for ( uint64_t t = 0; t < suthreads; ++t )
+				{
+					uint64_t const ulow = t * supacksize;
+					uint64_t const uhigh = std::min(ulow+supacksize,usize.back());
+					assert ( uhigh != ulow );
+
+					PP[uhigh] += PP[ulow];
+				}
+
+				std::vector < GenericWorkPackage < PackagePrefixSums > > VPPS(suthreads);
+				for ( uint64_t t = 0; t < suthreads; ++t )
+				{
+					VPPS[t] = GenericWorkPackage < PackagePrefixSums >(0,PrefixSumsDispatcher_id,PackagePrefixSums(t,supacksize,&usize,&GRKM,&PP,&finsem));
+					STP.enque(&VPPS[t]);
+				}
+				semWait(finsem,suthreads);
+
+				std::vector<uint64_t> uranges;
+				std::vector<uint64_t> urefk;
+				uint64_t const uspan = (PP[usize.back()] + numthreads - 1)/numthreads;
+
+				for ( uint64_t i = 0; i < numthreads; ++i )
+				{
+					uint64_t const utarget = i * uspan;
+					uint64_t const * pp = std::lower_bound(PP.begin(),PP.begin()+usize.back(),utarget);
+					uranges.push_back(pp-PP.begin());
+					urefk.push_back(*pp);
+				}
+				uranges.push_back(usize.back());
+				urefk.push_back(PP[usize.back()]);
+				assert ( uranges[0] == 0 );
+
+				#if 0
+				for ( uint64_t i = 0; i < uranges.size(); ++i )
+				{
+					std::cerr << "uranges[.]=" << uranges[i]
+						<< ((i > 0) ? (uranges[i]-uranges[i-1]) : 0)
+						<< std::endl;
+				}
+				#endif
+
+				#if 0
+				{
+					uint64_t s = 0;
+					for ( uint64_t i = 0; i < usize.back(); ++i )
+					{
+						assert ( PP[i] == s );
+						s += GRKM[i].high-GRKM[i].low;
+					}
+					assert ( PP[usize.back()] == s );
+				}
+				#endif
+
+				PP.release();
+				if ( verbose > 1 )
+					std::cerr << "[V] computed range prefix sums in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+
+				// lookup positions for ranks on suffix array
+				lclock.start();
+				GRQKM.ensureSize(gc);
+				std::vector<uint64_t> NUMREFKVALID(uranges.size());
+				uint64_t const numlsa = uranges.size() ? (uranges.size()-1) : 0;
+				std::vector < GenericWorkPackage < PackageLookupSA > > VLSA(numlsa);
+				for ( uint64_t t = 1; t < uranges.size(); ++t )
+				{
+					VLSA[t-1] = GenericWorkPackage < PackageLookupSA >(0,LookupSADispatcher_id,PackageLookupSA(t,k,&GRKM,&GRQKM,&uranges,&urefk,&NUMREFKVALID,&index,&finsem));
+					STP.enque(&VLSA[t-1]);
+				}
+				semWait(finsem,numlsa);
+
+				// concatenate
+				libmaus2::util::PrefixSums::prefixSums(NUMREFKVALID.begin(),NUMREFKVALID.end());
+				TGRQKM.ensureSize(NUMREFKVALID.back()+2);
+				uint64_t const numcomp = uranges.size() ? (uranges.size()-1) : 0;
+				std::vector < GenericWorkPackage < PackageCompactPos > > VCO(numcomp);
+				for ( uint64_t t = 1; t < uranges.size(); ++t )
+				{
+					VCO[t-1] = GenericWorkPackage < PackageCompactPos >(0,CompactPosDispatcher_id,PackageCompactPos(t,&GRQKM,&TGRQKM,&NUMREFKVALID,&urefk,&finsem));
+					STP.enque(&VCO[t-1]);
+				}
+				semWait(finsem,numcomp);
 				GRQKM.swap(TGRQKM);
-			#if 0
-			std::cerr << "CHECKING" << std::endl;
-			for ( uint64_t i = 1; i < NUMREFKVALID.back(); ++i )
-				assert ( GRQKM[i-1] < GRQKM[i] );
-			#endif
 
-			GRQKM.ensureSize(NUMREFKVALID.back() + 2);
+				assert ( NUMREFKVALID.size() );
+				assert ( GRQKM.size() >= NUMREFKVALID.back() );
+				assert ( TGRQKM.size() >= NUMREFKVALID.back() );
 
-			GRQKM[NUMREFKVALID.back()] = QIff;
-			GRQKM[NUMREFKVALID.back()+1] = QI0;
-			if ( verbose > 1 )
-				std::cerr << "[V] looked up and sorted positions in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
-
-			lclock.start();
-			libmaus2::util::PrefixSums::prefixSums(NUMQK.begin(),NUMQK.begin()+numpacks+1);
-			GQKM.ensureSize(NUMQK[numpacks]+2);
-
-			std::vector < GenericWorkPackage < PackageConcatQueryKmers > > VCQK(numpacks);
-			for ( uint64_t t = 0; t < numpacks; ++t )
-			{
-				VCQK[t] = GenericWorkPackage < PackageConcatQueryKmers >(0,ConcatQueryKmersDispatcher_id,PackageConcatQueryKmers(t,&QKM,&GQKM,&NUMQK,&finsem));
-				STP.enque(&VCQK[t]);
-			}
-			semWait(finsem,numpacks);
-			assert ( ! finsem.trywait() );
-			if ( verbose > 1 )
-				std::cerr << "[V] concatenated query kmers in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
-
-			lclock.start();
-			TGQKM.ensureSize(NUMQK[numpacks]+2);
-			// we sort the query kmers by the code field only, because readid and rpos are produced already in order and radix sort is stable
-			libmaus2::sorting::InterleavedRadixSort::byteradixsortKeyBytes(
-				GQKM.begin(),GQKM.begin()+NUMQK[numpacks],
-				TGQKM.begin(),TGQKM.begin()+NUMQK[numpacks],
-				numthreads,
-				keybytes.begin(),numkeybytes,STP);
-			if ( verbose > 1 )
-				std::cerr << "[V] sorted query kmers in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
-			if ( numkeybytes % 2 == 1 )
-				std::swap(GQKM,TGQKM);
-
-			#if 0
-			std::cerr << "checking q seeds" << std::endl;
-			for ( uint64_t i = 1; i < NUMQK[numpacks]; ++i )
-			{
-				assert (
-					GQKM[i-1].code < GQKM[i].code
-					||
-					(
-						GQKM[i-1].code == GQKM[i].code &&
-						GQKM[i-1].readid < GQKM[i].readid
-					)
-					||
-					(
-					GQKM[i-1].code == GQKM[i].code &&
-					GQKM[i-1].readid == GQKM[i].readid &&
-					GQKM[i-1].rpos < GQKM[i].rpos
-					)
+				// sort
+				libmaus2::sorting::InterleavedRadixSort::byteradixsortKeyBytes(
+					GRQKM.begin(),GRQKM.begin()+NUMREFKVALID.back(),
+					TGRQKM.begin(),TGRQKM.begin()+NUMREFKVALID.back(),
+					numthreads,
+					qfullkeybytes.begin(),qfullkeybytes.size(),STP
 				);
+				if ( qfullkeybytes.size() % 2 != 0 )
+					GRQKM.swap(TGRQKM);
+				#if 0
+				std::cerr << "CHECKING" << std::endl;
+				for ( uint64_t i = 1; i < NUMREFKVALID.back(); ++i )
+					assert ( GRQKM[i-1] < GRQKM[i] );
+				#endif
+
+				GRQKM.ensureSize(NUMREFKVALID.back() + 2);
+
+				GRQKM[NUMREFKVALID.back()] = QIff;
+				GRQKM[NUMREFKVALID.back()+1] = QI0;
+				if ( verbose > 1 )
+					std::cerr << "[V] looked up and sorted positions in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+
+				lclock.start();
+				libmaus2::util::PrefixSums::prefixSums(NUMQK.begin(),NUMQK.begin()+numpacks+1);
+				GQKM.ensureSize(NUMQK[numpacks]+2);
+
+				std::vector < GenericWorkPackage < PackageConcatQueryKmers > > VCQK(numpacks);
+				for ( uint64_t t = 0; t < numpacks; ++t )
+				{
+					VCQK[t] = GenericWorkPackage < PackageConcatQueryKmers >(0,ConcatQueryKmersDispatcher_id,PackageConcatQueryKmers(t,&QKM,&GQKM,&NUMQK,&finsem));
+					STP.enque(&VCQK[t]);
+				}
+				semWait(finsem,numpacks);
+				assert ( ! finsem.trywait() );
+				if ( verbose > 1 )
+					std::cerr << "[V] concatenated query kmers in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+
+				lclock.start();
+				TGQKM.ensureSize(NUMQK[numpacks]+2);
+				// we sort the query kmers by the code field only, because readid and rpos are produced already in order and radix sort is stable
+				libmaus2::sorting::InterleavedRadixSort::byteradixsortKeyBytes(
+					GQKM.begin(),GQKM.begin()+NUMQK[numpacks],
+					TGQKM.begin(),TGQKM.begin()+NUMQK[numpacks],
+					numthreads,
+					keybytes.begin(),numkeybytes,STP);
+				if ( verbose > 1 )
+					std::cerr << "[V] sorted query kmers in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+				if ( numkeybytes % 2 == 1 )
+					std::swap(GQKM,TGQKM);
+
+				#if 0
+				std::cerr << "checking q seeds" << std::endl;
+				for ( uint64_t i = 1; i < NUMQK[numpacks]; ++i )
+				{
+					assert (
+						GQKM[i-1].code < GQKM[i].code
+						||
+						(
+							GQKM[i-1].code == GQKM[i].code &&
+							GQKM[i-1].readid < GQKM[i].readid
+						)
+						||
+						(
+						GQKM[i-1].code == GQKM[i].code &&
+						GQKM[i-1].readid == GQKM[i].readid &&
+						GQKM[i-1].rpos < GQKM[i].rpos
+						)
+					);
+				}
+				#endif
+
+				GQKM[NUMQK[numpacks]] = QIff;
+				GQKM[NUMQK[numpacks]+1] = QI0;
+
+				#if 0
+				for ( uint64_t i = 1; i < NUMQK[numpacks]; ++i )
+					assert ( GQKM[i-1].code <= GQKM[i].code );
+				for ( uint64_t i = 1; i < NUMREFKVALID.back(); ++i )
+					assert ( GRQKM[i-1].code <= GRQKM[i].code );
+				#endif
+
+				// decode ref sequences for this index
+				lclock.start();
+				std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> Vseqmeta;
+				libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> Aseq;
+				index.loadBP(STP,Vseqmeta,Aseq,numthreads);
+				index.fillDazzlerDB(refdb,AREFHITREADS,Vseqmeta,Aseq.begin());
+				if ( verbose > 1 )
+					std::cerr << "[V] decode ref seqs in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+
+				#if 0
+				std::cerr << "checking seeds" << std::endl;
+				// check seed correctness by comparing reference and query text
+				QueryKMer * ref_a = GRQKM.begin();
+				QueryKMer * ref_e = ref_a + NUMREFKVALID.back();
+				QueryKMer * q_a = GQKM.begin();
+				QueryKMer * q_e = GQKM.begin() + NUMQK[numpacks];
+
+				while ( ref_a != ref_e && q_a != q_e )
+				{
+					if ( ref_a->code < q_a->code )
+						++ref_a;
+					else if ( q_a->code < ref_a->code )
+						++q_a;
+					else
+					{
+						uint64_t const code = q_a->code;
+						QueryKMer * ref_s = ref_a;
+						QueryKMer * q_s = q_a;
+
+						while ( ref_a != ref_e && ref_a->code == code )
+							++ref_a;
+						while ( q_a != q_e && q_a->code == code )
+							++q_a;
+
+						for ( QueryKMer * ref_c = ref_s; ref_c != ref_a; ++ref_c )
+							for ( QueryKMer * q_c = q_s; q_c != q_a; ++ q_c )
+							{
+								assert ( ref_c->code == q_c->code );
+
+								char const * aseq = reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[q_c->readid].boff;
+								char const * bseq = reinterpret_cast<char const *>(refdb.bases)   + refdb.reads[ref_c->readid].boff;
+
+								assert ( aseq[-1] == 4 );
+								assert ( aseq[readsdb.reads[q_c->readid].rlen] == 4 );
+								assert ( bseq[-1] == 4 );
+								assert ( bseq[refdb.reads[ref_c->readid].rlen] == 4 );
+
+								// std::cerr << std::string(80,'-') << std::endl;
+
+								for ( uint64_t z = 0; z < k; ++z )
+								{
+									// std::cerr << (int)aseq [ SP.apos + z ] << "\t" << (int)bseq [ SP.apos - SP.diag + z ] << std::endl;
+
+									assert (
+										aseq [ q_c->rpos + z ] ==
+										bseq [ ref_c->rpos + z ]
+									);
+								}
+
+							}
+					}
+				}
+				#endif
+				GRKM.release();
+				TGRKM.release();
+				TGQKM.release();
+				TGRQKM.release();
+
+				if ( NUMQK[numpacks] && NUMREFKVALID.back() )
+				{
+					lclock.start();
+					QueryKMer * Qindex = GRQKM.take();
+					Match_Filter(&readsdb, &refdb, GQKM.begin(), NUMQK[numpacks], Qindex, NUMREFKVALID.back(), (index_i==1) /* comp */, (index_i==0) /* start */);
+					indexyield += 1;
+					if ( verbose > 1 )
+						std::cerr << "[V] ran Match_Filter in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+				}
+				else
+				{
+					GRQKM.release();
+				}
+
+				GQKM.release();
 			}
-			#endif
 
-			GQKM[NUMQK[numpacks]] = QIff;
-			GQKM[NUMQK[numpacks]+1] = QI0;
-
-			#if 0
-			for ( uint64_t i = 1; i < NUMQK[numpacks]; ++i )
-				assert ( GQKM[i-1].code <= GQKM[i].code );
-			for ( uint64_t i = 1; i < NUMREFKVALID.back(); ++i )
-				assert ( GRQKM[i-1].code <= GRQKM[i].code );
-			#endif
-
-			// decode ref sequences for this index
 			lclock.start();
 			std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> Vseqmeta;
 			libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> Aseq;
-			index.loadBP(STP,Vseqmeta,Aseq,numthreads);
-			index.fillDazzlerDB(refdb,AREFHITREADS,Vseqmeta,Aseq.begin());
+			forwindex.loadBP(STP,Vseqmeta,Aseq,numthreads);
+			forwindex.fillDazzlerDB(refdb,AREFHITREADS,Vseqmeta,Aseq.begin());
 			if ( verbose > 1 )
 				std::cerr << "[V] decode ref seqs in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
 
-			#if 0
-			std::cerr << "checking seeds" << std::endl;
-			// check seed correctness by comparing reference and query text
-			QueryKMer * ref_a = GRQKM.begin();
-			QueryKMer * ref_e = ref_a + NUMREFKVALID.back();
-			QueryKMer * q_a = GQKM.begin();
-			QueryKMer * q_e = GQKM.begin() + NUMQK[numpacks];
+			std::string const tmpprefix = libmaus2::util::ArgInfo::getDefaultTmpFileName(arg.progname);
+			libmaus2::util::WriteableString Wprefix(tmpprefix + "_reads");
+			libmaus2::util::WriteableString Wref("ref");
 
-			while ( ref_a != ref_e && q_a != q_e )
+			std::vector<std::string> Voutfn;
+
+			if ( indexyield )
 			{
-				if ( ref_a->code < q_a->code )
-					++ref_a;
-				else if ( q_a->code < ref_a->code )
-					++q_a;
-				else
+				Reporter(Wprefix.A.begin(), &readsdb, Wref.A.begin(), &refdb, aspec, FLAG_DOB /* mflag */);
+
+				// for ( uint64_t i = 1; i <= NTHREADS; ++i )
+				for ( uint64_t i = 1; i <= numthreads; ++i )
 				{
-					uint64_t const code = q_a->code;
-					QueryKMer * ref_s = ref_a;
-					QueryKMer * q_s = q_a;
-
-					while ( ref_a != ref_e && ref_a->code == code )
-						++ref_a;
-					while ( q_a != q_e && q_a->code == code )
-						++q_a;
-
-					for ( QueryKMer * ref_c = ref_s; ref_c != ref_a; ++ref_c )
-						for ( QueryKMer * q_c = q_s; q_c != q_a; ++ q_c )
-						{
-							assert ( ref_c->code == q_c->code );
-
-							char const * aseq = reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[q_c->readid].boff;
-							char const * bseq = reinterpret_cast<char const *>(refdb.bases)   + refdb.reads[ref_c->readid].boff;
-
-							assert ( aseq[-1] == 4 );
-							assert ( aseq[readsdb.reads[q_c->readid].rlen] == 4 );
-							assert ( bseq[-1] == 4 );
-							assert ( bseq[refdb.reads[ref_c->readid].rlen] == 4 );
-
-							// std::cerr << std::string(80,'-') << std::endl;
-
-							for ( uint64_t z = 0; z < k; ++z )
-							{
-								// std::cerr << (int)aseq [ SP.apos + z ] << "\t" << (int)bseq [ SP.apos - SP.diag + z ] << std::endl;
-
-								assert (
-									aseq [ q_c->rpos + z ] ==
-									bseq [ ref_c->rpos + z ]
-								);
-							}
-
-						}
+					std::ostringstream fnostr;
+					#if 0
+					fnostr
+						<< Wref.A.begin()
+						<< "."
+						<< Wprefix.A.begin()
+						<< ".R" << i << ".las";
+					#else
+					fnostr
+						<< "/tmp/"
+						<< Wref.A.begin()
+						<< "."
+						<< Wprefix.A.begin()
+						<< ".R" << i << ".las";
+					#endif
+					Voutfn.push_back(fnostr.str());
 				}
 			}
-			#endif
-			GRKM.release();
-			TGRKM.release();
-			TGQKM.release();
-			TGRQKM.release();
 
-			if ( NUMQK[numpacks] && NUMREFKVALID.back() )
+			libmaus2::dazzler::align::SimpleOverlapVectorParser::unique_ptr_type PSOP(
+				new libmaus2::dazzler::align::SimpleOverlapVectorParser(
+					Voutfn,1024*1024 /* bufsize */,
+					libmaus2::dazzler::align::OverlapParser::overlapparser_do_not_split_b
+				)
+			);
+
+			int64_t prevmark = -1;
+
+			while ( PSOP->parseNextBlock() )
 			{
-				lclock.start();
-				QueryKMer * Qindex = GRQKM.take();
-				Match_Filter(&readsdb, &refdb, GQKM.begin(), NUMQK[numpacks], Qindex, NUMREFKVALID.back(), (index_i==1) /* comp */, (index_i==0) /* start */);
-				indexyield += 1;
-				if ( verbose > 1 )
-					std::cerr << "[V] ran Match_Filter in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
-			}
-			else
-			{
-				GRQKM.release();
-			}
+				libmaus2::dazzler::align::OverlapData & OVLdata = PSOP->getData();
 
-			GQKM.release();
-		}
+				uint64_t rlow = 0;
+				uint64_t rsum = 0;
+				uint64_t linesperthread = (OVLdata.size() + numthreads - 1) / numthreads;
+				std::vector<uint64_t> ointv;
+				ointv.push_back(0);
 
-		lclock.start();
-		std::vector<libmaus2::fastx::FastaBPDecoderIdentity::SequenceMeta> Vseqmeta;
-		libmaus2::autoarray::AutoArray<char,libmaus2::autoarray::alloc_type_c> Aseq;
-		forwindex.loadBP(STP,Vseqmeta,Aseq,numthreads);
-		forwindex.fillDazzlerDB(refdb,AREFHITREADS,Vseqmeta,Aseq.begin());
-		if ( verbose > 1 )
-			std::cerr << "[V] decode ref seqs in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
+				while ( rlow < OVLdata.size() )
+				{
+					// reference b read id
+					int64_t const refb = libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(rlow).first);
+					uint64_t rhigh = rlow+1;
 
-		std::string const tmpprefix = libmaus2::util::ArgInfo::getDefaultTmpFileName(arg.progname);
-		libmaus2::util::WriteableString Wprefix(tmpprefix + "_reads");
-		libmaus2::util::WriteableString Wref("ref");
+					// look for end of b read range
+					while ( rhigh < OVLdata.size() && libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(rhigh).first) == refb )
+						++rhigh;
 
-		std::vector<std::string> Voutfn;
+					// update sum
+					rsum += (rhigh-rlow);
 
-		if ( indexyield )
-		{
-			Reporter(Wprefix.A.begin(), &readsdb, Wref.A.begin(), &refdb, aspec, FLAG_DOB /* mflag */);
+					// if we have enough
+					if ( rsum >= linesperthread )
+					{
+						rsum = 0;
+						ointv.push_back(rhigh);
+					}
 
-			// for ( uint64_t i = 1; i <= NTHREADS; ++i )
-			for ( uint64_t i = 1; i <= numthreads; ++i )
-			{
-				std::ostringstream fnostr;
-				#if 0
-				fnostr
-					<< Wref.A.begin()
-					<< "."
-					<< Wprefix.A.begin()
-					<< ".R" << i << ".las";
-				#else
-				fnostr
-					<< "/tmp/"
-					<< Wref.A.begin()
-					<< "."
-					<< Wprefix.A.begin()
-					<< ".R" << i << ".las";
-				#endif
-				Voutfn.push_back(fnostr.str());
-			}
-		}
+					rlow = rhigh;
+				}
 
-		libmaus2::dazzler::align::SimpleOverlapVectorParser::unique_ptr_type PSOP(
-			new libmaus2::dazzler::align::SimpleOverlapVectorParser(
-				Voutfn,1024*1024 /* bufsize */,
-				libmaus2::dazzler::align::OverlapParser::overlapparser_do_not_split_b
-			)
-		);
-
-		int64_t prevmark = -1;
-
-		while ( PSOP->parseNextBlock() )
-		{
-			libmaus2::dazzler::align::OverlapData & OVLdata = PSOP->getData();
-
-			uint64_t rlow = 0;
-			uint64_t rsum = 0;
-			uint64_t linesperthread = (OVLdata.size() + numthreads - 1) / numthreads;
-			std::vector<uint64_t> ointv;
-			ointv.push_back(0);
-
-			while ( rlow < OVLdata.size() )
-			{
-				// reference b read id
-				int64_t const refb = libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(rlow).first);
-				uint64_t rhigh = rlow+1;
-
-				// look for end of b read range
-				while ( rhigh < OVLdata.size() && libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(rhigh).first) == refb )
-					++rhigh;
-
-				// update sum
-				rsum += (rhigh-rlow);
-
-				// if we have enough
-				if ( rsum >= linesperthread )
+				if ( rsum )
 				{
 					rsum = 0;
-					ointv.push_back(rhigh);
+					ointv.push_back(rlow);
 				}
 
-				rlow = rhigh;
+				for ( uint64_t i = 1; i < ointv.size(); ++i )
+					assert ( ointv[i] > ointv[i-1] );
+
+				assert ( ointv.size() > 0 );
+				assert ( ointv.size()-1 <= numthreads );
+				assert ( ointv.back() == OVLdata.size() );
+
+				uint64_t const numointv = ointv.size() ? (ointv.size()-1) : 0;
+				std::vector < GenericWorkPackage < PackageEncodeBam > > VEB(numointv);
+				for ( uint64_t zr = 1; zr < ointv.size(); ++zr )
+				{
+					VEB[zr-1] = GenericWorkPackage < PackageEncodeBam >(
+						0,EncodeBamDispatcher_id,
+						PackageEncodeBam(zr,&ointv,&Acontexts,&OVLdata,prevmark,&Areadnames,&Pbamheader,&O,&refdb,&readsdb,&Abam,&Obam,oobam,&finsem)
+					);
+					STP.enque(&VEB[zr-1]);
+				}
+				semWait(finsem,numointv);
+
+				std::vector<std::pair<uint8_t *,uint8_t *> > Vlinfrag;
+				for ( uint64_t zr = 1; zr < ointv.size(); ++zr )
+				{
+					uint64_t const tid = zr-1;
+					LASToBamContext & context = *(Acontexts[tid]);
+					libmaus2::bambam::parallel::FragmentAlignmentBufferFragment & fragment = context.fragment;
+					fragment.getLinearOutputFragments(libmaus2::lz::BgzfConstants::getBgzfMaxBlockSize(),Vlinfrag);
+				}
+
+				struct CompressionPackage
+				{
+					std::pair<uint8_t *,uint8_t *> P;
+					libmaus2::lz::BgzfDeflateOutputBufferBase::shared_ptr_type B;
+					libmaus2::lz::BgzfDeflateZStreamBaseFlushInfo info;
+
+					CompressionPackage() {}
+					CompressionPackage(std::pair<uint8_t *,uint8_t *> const & rP, libmaus2::lz::BgzfDeflateOutputBufferBase::shared_ptr_type rB)
+					: P(rP), B(rB) {}
+				};
+
+				std::vector < CompressionPackage > VCP(Vlinfrag.size());
+				for ( uint64_t i = 0; i < Vlinfrag.size(); ++i )
+				{
+					VCP[i] = CompressionPackage(Vlinfrag[i],bgzffreelist.get());
+				}
+
+				#if defined(_OPENMP)
+				#pragma omp parallel for schedule(dynamic,1)
+				#endif
+				for ( uint64_t i = 0; i < VCP.size(); ++i )
+				{
+					libmaus2::lz::BgzfDeflateZStreamBase::shared_ptr_type zstreambase = zstreambasefreelist.get();
+					VCP[i].info = zstreambase->flush(VCP[i].P.first,VCP[i].P.second,*(VCP[i].B));
+					zstreambasefreelist.put(zstreambase);
+				}
+
+				for ( uint64_t i = 0; i < VCP.size(); ++i )
+				{
+					uint8_t const * u = VCP[i].B->outbuf.begin();
+
+					std::cout.write(reinterpret_cast<char const *>(u),VCP[i].info.getCompressedSize());
+					bgzffreelist.put(VCP[i].B);
+				}
+
+				#if 0
+					bgzfout->write(reinterpret_cast<char const *>(Vlinfrag[i].first),Vlinfrag[i].second-Vlinfrag[i].first);
+
+					libmaus2::lz::BgzfDeflateOutputBufferBase::shared_ptr_type buffer = bgzffreelist.get();
+					#if 0
+					uint8_t const * bufferstart = fragment.pa;
+					uint8_t const * bufferend = fragment.pc;
+					char const * cbufferstart = reinterpret_cast<char const *>(bufferstart);
+					uint64_t const len = bufferend - bufferstart;
+					bgzfout->write(cbufferstart,len);
+					#endif
+				}
+				#endif
+
+				if ( OVLdata.size() )
+					prevmark = libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(OVLdata.size()-1).first);
+
+				if ( verbose > 1 )
+					std::cerr << "[V] processed " << OVLdata.size() << " alignments " << libmaus2::util::MemUsage() << std::endl;
 			}
 
-			if ( rsum )
+			running = havedata;
+
+			totalreads += numreads;
+
+			if ( verbose > 0 )
 			{
-				rsum = 0;
-				ointv.push_back(rlow);
+				double const rcl = roundclock.getElapsedSeconds();
+				double const acccl = accclock.getElapsedSeconds();
+				double const roundalpersec = numreads / rcl;
+				double const accalpersec = totalreads / acccl;
+
+				std::cerr << "[V]"
+					<< " processed " << numreads << " reads in time " << roundclock.formatTime(rcl)
+					<< " " << roundalpersec << " al/s"
+					<< " total " << totalreads << " time " << accclock.formatTime(acccl)
+					<< " " << accalpersec << " al/s"
+					<< " " << accalpersec*60*60 << " al/h"
+					<< std::endl;
 			}
 
-			for ( uint64_t i = 1; i < ointv.size(); ++i )
-				assert ( ointv[i] > ointv[i-1] );
-
-			assert ( ointv.size() > 0 );
-			assert ( ointv.size()-1 <= numthreads );
-			assert ( ointv.back() == OVLdata.size() );
-
-			uint64_t const numointv = ointv.size() ? (ointv.size()-1) : 0;
-			std::vector < GenericWorkPackage < PackageEncodeBam > > VEB(numointv);
-			for ( uint64_t zr = 1; zr < ointv.size(); ++zr )
-			{
-				VEB[zr-1] = GenericWorkPackage < PackageEncodeBam >(
-					0,EncodeBamDispatcher_id,PackageEncodeBam(zr,&ointv,&Acontexts,&OVLdata,prevmark,&Areadnames,&Pbamheader,&O,&refdb,&readsdb,&finsem)
-				);
-				STP.enque(&VEB[zr-1]);
-			}
-			semWait(finsem,numointv);
-
-			for ( uint64_t zr = 1; zr < ointv.size(); ++zr )
-			{
-				uint64_t const tid = zr-1;
-				LASToBamContext & context = *(Acontexts[tid]);
-				libmaus2::bambam::parallel::FragmentAlignmentBufferFragment & fragment = context.fragment;
-
-				uint8_t const * bufferstart = fragment.pa;
-				uint8_t const * bufferend = fragment.pc;
-				char const * cbufferstart = reinterpret_cast<char const *>(bufferstart);
-				uint64_t const len = bufferend - bufferstart;
-				bgzfout->write(cbufferstart,len);
-			}
-
-			if ( OVLdata.size() )
-				prevmark = libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(OVLdata.size()-1).first);
-
-			if ( verbose > 1 )
-				std::cerr << "[V] processed " << OVLdata.size() << " alignments " << libmaus2::util::MemUsage() << std::endl;
+			for ( uint64_t i = 0; i < Voutfn.size(); ++i )
+				libmaus2::aio::FileRemoval::removeFile(Voutfn[i]);
 		}
 
-		running = havedata;
+		// bgzfout->flush();
+		bgzfout->addEOFBlock();
+		bgzfout.reset();
 
-		totalreads += numreads;
+		Free_Align_Spec(aspec);
 
-		if ( verbose > 0 )
-		{
-			double const rcl = roundclock.getElapsedSeconds();
-			double const acccl = accclock.getElapsedSeconds();
-			double const roundalpersec = numreads / rcl;
-			double const accalpersec = totalreads / acccl;
+		STP.terminate();
 
-			std::cerr << "[V]"
-				<< " processed " << numreads << " reads in time " << roundclock.formatTime(rcl)
-				<< " " << roundalpersec << " al/s"
-				<< " total " << totalreads << " time " << accclock.formatTime(acccl)
-				<< " " << accalpersec << " al/s"
-				<< " " << accalpersec*60*60 << " al/h"
-				<< std::endl;
-		}
-
-		for ( uint64_t i = 0; i < Voutfn.size(); ++i )
-			libmaus2::aio::FileRemoval::removeFile(Voutfn[i]);
+		return EXIT_SUCCESS;
 	}
-
-	bgzfout->flush();
-	bgzfout->addEOFBlock();
-	bgzfout.reset();
-
-	Free_Align_Spec(aspec);
-
-	STP.terminate();
-
-	return EXIT_SUCCESS;
+	catch(...)
+	{
+		STP.terminate();
+		throw;
+	}
 }
 
 #include <config.h>
@@ -3140,6 +3458,7 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " -T: prefix for temporary files used during index construction\n";
 	ostr << " -Q: file name of index\n";
 	ostr << " -S: storage strategy for non primary alignments (none, soft, hard)\n";
+	ostr << " -z: output BAM compression level (zlib default)\n";
 
 	return ostr.str();
 }
