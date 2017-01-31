@@ -3459,6 +3459,7 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " -Q: file name of index\n";
 	ostr << " -S: storage strategy for non primary alignments (none, soft, hard)\n";
 	ostr << " -z: output BAM compression level (zlib default)\n";
+	ostr << " -I: input format (fasta (default) or bam)\n";
 
 	return ostr.str();
 }
