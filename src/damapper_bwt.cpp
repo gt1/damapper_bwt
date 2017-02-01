@@ -2127,6 +2127,104 @@ static void threadEncodeBam(PackageEncodeBam package)
 	package.finsem->post();
 }
 
+struct PackageEncodeUnmapped
+{
+	uint64_t t;
+	uint64_t firstuncoded;
+	uint64_t uncodedperthread;
+	uint64_t numreads;
+	libmaus2::autoarray::AutoArray<LASToBamContext::unique_ptr_type> * Acontexts;
+	libmaus2::autoarray::AutoArray<char> * Areadnames;
+	libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > * O;
+	libmaus2::autoarray::AutoArray<uint8_t> * Abam;
+	libmaus2::autoarray::AutoArray< uint64_t > * Obam;
+	uint64_t oobam;
+	HITS_DB * readsdb;
+	libmaus2::bambam::BamHeader::unique_ptr_type * Pbamheader;
+	libmaus2::parallel::PosixSemaphore *finsem;
+
+	PackageEncodeUnmapped() {}
+	PackageEncodeUnmapped(
+		uint64_t const rt,
+		uint64_t const rfirstuncoded,
+		uint64_t const runcodedperthread,
+		uint64_t const rnumreads,
+		libmaus2::autoarray::AutoArray<LASToBamContext::unique_ptr_type> * rAcontexts,
+		libmaus2::autoarray::AutoArray<char> * rAreadnames,
+		libmaus2::autoarray::AutoArray< libmaus2::fastx::LineBufferFastAReader::ReadMeta > * rO,
+		libmaus2::autoarray::AutoArray<uint8_t> * rAbam,
+		libmaus2::autoarray::AutoArray< uint64_t > * rObam,
+		uint64_t const roobam,
+		HITS_DB * rreadsdb,
+		libmaus2::bambam::BamHeader::unique_ptr_type * rPbamheader,
+		libmaus2::parallel::PosixSemaphore *rfinsem
+	) : t(rt), firstuncoded(rfirstuncoded), uncodedperthread(runcodedperthread), numreads(rnumreads),
+	    Acontexts(rAcontexts), Areadnames(rAreadnames), O(rO), Abam(rAbam), Obam(rObam), oobam(roobam), readsdb(rreadsdb),
+	    Pbamheader(rPbamheader), finsem(rfinsem)
+	{
+
+	}
+};
+
+static void threadEncodeUnmapped(PackageEncodeUnmapped package)
+{
+	uint64_t const plow  = std::min(package.firstuncoded + package.t * package.uncodedperthread,package.numreads);
+	uint64_t const phigh = std::min(plow + package.uncodedperthread,package.numreads);
+	LASToBamContext & context = *((*(package.Acontexts))[package.t]);
+	context.fragment.reset();
+
+	libmaus2::bambam::BamAuxFilterVector auxfilter;
+	auxfilter.set('A','S');
+	auxfilter.set('M','D');
+	auxfilter.set('N','M');
+	auxfilter.set('c','i');
+	auxfilter.set('c','n');
+	auxfilter.set('c','j');
+	auxfilter.set('c','l');
+	libmaus2::autoarray::AutoArray < libmaus2::bambam::BamAlignmentDecoderBase::AuxInfo > auxinfo;
+	libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * > Aauxadd;					libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest > Aauxcopy;
+
+	for ( uint64_t i = plow; i < phigh; ++i )
+	{
+		char const * rname = package.Areadnames->begin() + (*(package.O))[i].nameoff;
+		char const * rdata = reinterpret_cast<char const *>(package.readsdb->bases) + package.readsdb->reads[i].boff;
+		uint64_t const readlen = package.readsdb->reads[i].rlen;
+		assert ( rdata[-1] == 4 );
+		assert ( rdata[readlen] == 4 );
+
+		uint8_t * pbam = 0;
+		uint64_t bamlen = 0;
+		uint64_t oauxadd = 0;
+		uint64_t oauxcopy = 0;
+
+		if ( static_cast<int64_t>(i + 1) < static_cast<int64_t>(package.oobam) )
+		{
+			pbam = package.Abam->begin() + package.Obam->at(i);
+			bamlen = package.Obam->at(i+1)-package.Obam->at(i);
+
+			uint64_t const naux = libmaus2::bambam::BamAlignmentDecoderBase::enumerateAuxTagsFilterOut(pbam,bamlen,auxinfo,auxfilter);
+
+			for ( uint64_t j = 0; j < naux; ++j )
+			{
+				Aauxcopy.push(
+					oauxcopy,
+					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest(pbam + auxinfo[j].o,auxinfo[j].l)
+				);
+				// std::cerr << "[" << j << "] " << auxinfo[j].tag[0] << auxinfo[j].tag[1] << std::endl;
+			}
+		}
+
+		for ( uint64_t j = 0; j < oauxcopy; ++j )
+			Aauxadd.push(oauxadd,&Aauxcopy[j]);
+
+		libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &Aauxadd[0];
+		libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &Aauxadd[oauxadd];
+
+		context.converter.convertUnmapped(rdata,readlen,rname,context.fragment,**(package.Pbamheader),aux_a,aux_e);
+	}
+
+	package.finsem->post();
+}
 
 static void semWait(libmaus2::parallel::PosixSemaphore & finsem, uint64_t const t)
 {
@@ -2338,9 +2436,23 @@ struct EncodeBamDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageD
 	}
 };
 
+struct EncodeUnmappedDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
+{
+	typedef EncodeUnmappedDispatcher this_type;
+	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
+	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
+
+	virtual void dispatch(libmaus2::parallel::SimpleThreadWorkPackage * P, libmaus2::parallel::SimpleThreadPoolInterfaceEnqueTermInterface & /* tpi */)
+	{
+		GenericWorkPackage<PackageEncodeUnmapped> * RP = dynamic_cast< GenericWorkPackage<PackageEncodeUnmapped> * >(P);
+		assert ( RP );
+		threadEncodeUnmapped(RP->package);
+	}
+};
+
 struct CompressBgzfDispatcher : public libmaus2::parallel::SimpleThreadWorkPackageDispatcher
 {
-	typedef EncodeBamDispatcher this_type;
+	typedef CompressBgzfDispatcher this_type;
 	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
 	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
 
@@ -2428,6 +2540,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		ConcatQueryKmersDispatcher CQKD;
 		EncodeBamDispatcher EBD;
 		CompressBgzfDispatcher CBD;
+		EncodeUnmappedDispatcher EUD;
 		uint64_t const SearchKmersDispatcher_id = STP.getNextDispatcherId();
 		uint64_t const ConcatSADispatcher_id = STP.getNextDispatcherId();
 		uint64_t const FillHistDispatcher_id = STP.getNextDispatcherId();
@@ -2441,6 +2554,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		uint64_t const ConcatQueryKmersDispatcher_id = STP.getNextDispatcherId();
 		uint64_t const EncodeBamDispatcher_id = STP.getNextDispatcherId();
 		uint64_t const CompressBgzfDispatcher_id = STP.getNextDispatcherId();
+		uint64_t const EncodeUnmappedDispatcher_id = STP.getNextDispatcherId();
 		STP.registerDispatcher(SearchKmersDispatcher_id,&SKD);
 		STP.registerDispatcher(ConcatSADispatcher_id,&CSAD);
 		STP.registerDispatcher(FillHistDispatcher_id,&FHD);
@@ -2454,6 +2568,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 		STP.registerDispatcher(ConcatQueryKmersDispatcher_id,&CQKD);
 		STP.registerDispatcher(EncodeBamDispatcher_id,&EBD);
 		STP.registerDispatcher(CompressBgzfDispatcher_id,&CBD);
+		STP.registerDispatcher(EncodeUnmappedDispatcher_id,&EUD);
 
 		std::string const s_supstrat = arg.uniqueArgPresent("S") ? arg["S"] : "none";
 
@@ -3426,8 +3541,6 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 					bgzffreelist.put(DVCB[i].package.B);
 				}
 
-				std::cerr << "[V] cap " << zstreambasefreelist.capacity() << " " << bgzffreelist.capacity() << std::endl;
-
 				if ( OVLdata.size() )
 				{
 					prevmark = libmaus2::dazzler::align::OverlapData::getBRead(OVLdata.getData(OVLdata.size()-1).first);
@@ -3438,11 +3551,106 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 					std::cerr << "[V] processed " << OVLdata.size() << " alignments " << libmaus2::util::MemUsage() << std::endl;
 			}
 
-			std::cerr << "[V] maxbread=" << maxbread << " numreads=" << numreads << std::endl;
-
-			for ( uint64_t i = maxbread + 1; i < numreads; ++i )
+			uint64_t const firstuncoded = maxbread + 1;
+			if ( firstuncoded < numreads )
 			{
-				std::cerr << "[V] read " << i << " missing in output" << std::endl;
+				uint64_t const numuncoded = numreads - firstuncoded;
+
+				assert ( numuncoded );
+				uint64_t const uncodedperthread = (numuncoded + numthreads - 1)/numthreads;
+
+				std::vector < GenericWorkPackage < PackageEncodeUnmapped > > DVEU(numthreads);
+				for ( uint64_t t = 0; t < numthreads; ++t )
+				{
+					DVEU[t] = GenericWorkPackage < PackageEncodeUnmapped >(
+						0 /* prio */, EncodeUnmappedDispatcher_id,
+						PackageEncodeUnmapped(t,firstuncoded,uncodedperthread,numreads,&Acontexts,&Areadnames,&O,&Abam,&Obam,oobam,&readsdb,&Pbamheader,&finsem)
+					);
+					STP.enque(&DVEU[t]);
+
+					#if 0
+					uint64_t const plow  = std::min(firstuncoded + t * uncodedperthread,numreads);
+					uint64_t const phigh = std::min(plow + uncodedperthread,numreads);
+					LASToBamContext & context = *(Acontexts[t]);
+					context.fragment.reset();
+
+					libmaus2::bambam::BamAuxFilterVector auxfilter;
+					auxfilter.set('A','S');
+					auxfilter.set('M','D');
+					auxfilter.set('N','M');
+					auxfilter.set('c','i');
+					auxfilter.set('c','n');
+					auxfilter.set('c','j');
+					auxfilter.set('c','l');
+					libmaus2::autoarray::AutoArray < libmaus2::bambam::BamAlignmentDecoderBase::AuxInfo > auxinfo;
+					libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * > Aauxadd;					libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest > Aauxcopy;
+
+					for ( uint64_t i = plow; i < phigh; ++i )
+					{
+						char const * rname = Areadnames.begin() + O[i].nameoff;
+						char const * rdata = reinterpret_cast<char const *>(readsdb.bases) + readsdb.reads[i].boff;
+						uint64_t const readlen = readsdb.reads[i].rlen;
+						assert ( rdata[-1] == 4 );
+						assert ( rdata[readlen] == 4 );
+
+						uint8_t * pbam = 0;
+						uint64_t bamlen = 0;
+						uint64_t oauxadd = 0;
+						uint64_t oauxcopy = 0;
+
+						if ( static_cast<int64_t>(i + 1) < static_cast<int64_t>(oobam) )
+						{
+							pbam = Abam.begin() + Obam.at(i);
+							bamlen = Obam.at(i+1)-Obam.at(i);
+
+							uint64_t const naux = libmaus2::bambam::BamAlignmentDecoderBase::enumerateAuxTagsFilterOut(pbam,bamlen,auxinfo,auxfilter);
+
+							for ( uint64_t j = 0; j < naux; ++j )
+							{
+								Aauxcopy.push(
+									oauxcopy,
+									libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest(pbam + auxinfo[j].o,auxinfo[j].l)
+								);
+								// std::cerr << "[" << j << "] " << auxinfo[j].tag[0] << auxinfo[j].tag[1] << std::endl;
+							}
+						}
+
+						for ( uint64_t j = 0; j < oauxcopy; ++j )
+							Aauxadd.push(oauxadd,&Aauxcopy[j]);
+
+						libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &Aauxadd[0];
+						libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &Aauxadd[oauxadd];
+
+						context.converter.convertUnmapped(rdata,readlen,rname,context.fragment,*(Pbamheader),aux_a,aux_e);
+					}
+					#endif
+				}
+				semWait(finsem,DVEU.size());
+
+				std::vector<std::pair<uint8_t *,uint8_t *> > Vlinfrag;
+				for ( uint64_t t = 0; t < numthreads; ++t )
+				{
+					LASToBamContext & context = *(Acontexts[t]);
+					libmaus2::bambam::parallel::FragmentAlignmentBufferFragment & fragment = context.fragment;
+					fragment.getLinearOutputFragments(libmaus2::lz::BgzfConstants::getBgzfMaxBlockSize(),Vlinfrag);
+				}
+
+
+				std::vector < libmaus2::lz::BgzfDeflateZStreamBaseFlushInfo > VBinfo(Vlinfrag.size());
+				std::vector < GenericWorkPackage < PackageCompressBgzf > > DVCB(Vlinfrag.size());
+				for ( uint64_t i = 0; i < Vlinfrag.size(); ++i )
+				{
+					DVCB[i] = GenericWorkPackage < PackageCompressBgzf >(0/*prio*/,CompressBgzfDispatcher_id,PackageCompressBgzf(&zstreambasefreelist,Vlinfrag[i],bgzffreelist.get(),&VBinfo[i],&finsem));
+					STP.enque(&DVCB[i]);
+				}
+				semWait(finsem,DVCB.size());
+
+				for ( uint64_t i = 0; i < DVCB.size(); ++i )
+				{
+					uint8_t const * u = DVCB[i].package.B->outbuf.begin();
+					std::cout.write(reinterpret_cast<char const *>(u),DVCB[i].package.info->getCompressedSize());
+					bgzffreelist.put(DVCB[i].package.B);
+				}
 			}
 
 			running = havedata;
