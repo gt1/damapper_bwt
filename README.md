@@ -66,6 +66,7 @@ The following parameters can be used (no space allowed between option an argumen
 * -S: sequence storage strategy for non primary alignments (none (default), soft, hard)
 * -z: output BAM compression level (zlib default)
 * -I: input format (fasta (default) or bam)
+* -Z: do not encode secondary alignments (default: report secondary hits)
 
 BAM output files
 ----------------

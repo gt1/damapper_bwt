@@ -1858,6 +1858,8 @@ struct PackageEncodeBam
 	libmaus2::autoarray::AutoArray< uint64_t > * Obam;
 	uint64_t oobam;
 
+	bool encodesecondary;
+
 	libmaus2::parallel::PosixSemaphore *finsem;
 
 	PackageEncodeBam() {}
@@ -1876,9 +1878,11 @@ struct PackageEncodeBam
 		libmaus2::autoarray::AutoArray<uint8_t> * rAbam,
 		libmaus2::autoarray::AutoArray< uint64_t > * rObam,
 		uint64_t roobam,
+		bool const rencodesecondary,
 		libmaus2::parallel::PosixSemaphore *rfinsem
 	) : zr(rzr), ointv(rointv), Acontexts(rAcontexts), OVLdata(rOVLdata), prevmark(rprevmark), Areadnames(rAreadnames),
-	    Pbamheader(rPbamheader), O(rO), refdb(rrefdb), readsdb(rreadsdb), Abam(rAbam), Obam(rObam), oobam(roobam), finsem(rfinsem)
+	    Pbamheader(rPbamheader), O(rO), refdb(rrefdb), readsdb(rreadsdb), Abam(rAbam), Obam(rObam), oobam(roobam),
+	    encodesecondary(rencodesecondary), finsem(rfinsem)
 	{
 
 	}
@@ -1997,124 +2001,124 @@ static void threadEncodeBam(PackageEncodeBam package)
 			uint64_t const lchainid = chainid++;
 			bool const secondary = (lchainid > 0);
 
-			for ( uint64_t z = il; z < ih; ++z )
-			{
-				std::pair<uint8_t const *, uint8_t const *> const P = (package.OVLdata)->getData(z);
-
-				int64_t const aread = libmaus2::dazzler::align::OverlapData::getARead(P.first);
-				int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead(P.first);
-				int64_t const flags = libmaus2::dazzler::align::OverlapData::getFlags(P.first);
-				bool const inverse = libmaus2::dazzler::align::OverlapData::getInverseFlag(P.first);
-				char const * readname = (package.Areadnames)->begin() + (*(package.O))[bread].nameoff;
-
-				uint64_t oauxcopy = 0;
-				if ( pbam )
+			if ( (!secondary) || package.encodesecondary )
+				for ( uint64_t z = il; z < ih; ++z )
 				{
-					uint64_t const naux = libmaus2::bambam::BamAlignmentDecoderBase::enumerateAuxTagsFilterOut(pbam,bamlen,auxinfo,auxfilter);
+					std::pair<uint8_t const *, uint8_t const *> const P = (package.OVLdata)->getData(z);
 
-					for ( uint64_t i = 0; i < naux; ++i )
+					int64_t const aread = libmaus2::dazzler::align::OverlapData::getARead(P.first);
+					int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead(P.first);
+					int64_t const flags = libmaus2::dazzler::align::OverlapData::getFlags(P.first);
+					bool const inverse = libmaus2::dazzler::align::OverlapData::getInverseFlag(P.first);
+					char const * readname = (package.Areadnames)->begin() + (*(package.O))[bread].nameoff;
+
+					uint64_t oauxcopy = 0;
+					if ( pbam )
 					{
-						Aauxcopy.push(
-							oauxcopy,
-							libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest(pbam + auxinfo[i].o,auxinfo[i].l)
-						);
-						// std::cerr << "[" << i << "] " << auxinfo[i].tag[0] << auxinfo[i].tag[1] << std::endl;
+						uint64_t const naux = libmaus2::bambam::BamAlignmentDecoderBase::enumerateAuxTagsFilterOut(pbam,bamlen,auxinfo,auxfilter);
+
+						for ( uint64_t i = 0; i < naux; ++i )
+						{
+							Aauxcopy.push(
+								oauxcopy,
+								libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest(pbam + auxinfo[i].o,auxinfo[i].l)
+							);
+							// std::cerr << "[" << i << "] " << auxinfo[i].tag[0] << auxinfo[i].tag[1] << std::endl;
+						}
+					}
+
+					#if 0
+					if ( pbam )
+					{
+						std::cerr << readname << "\t" << libmaus2::bambam::BamAlignmentDecoderBase::getReadName(pbam) << std::endl;
+					}
+					#endif
+
+					bool const supplementary = (z != il);
+
+					// bool const primary = libmaus2::dazzler::align::OverlapData::getPrimaryFlag(P.first);
+					uint64_t const readlen = (package.readsdb)->reads[bread].rlen;
+
+					if ( z==ilow )
+					{
+						// compute reverse complement
+						context.ARC.ensureSize(readlen + 2);
+
+						char * const ra = context.ARC.begin();
+						char * rp = ra + readlen + 2;
+						char const * src = reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff - 1;
+
+						*(--rp)	= (*(src++));
+						while ( rp != ra+1 )
+							*(--rp)	= (*(src++)) ^ 3;
+						*(--rp)	= (*(src++));
+					}
+
+					uint64_t oauxadd = 0;
+					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_i("ci",lchainid);
+					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_n("cn",numchains);
+					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_j("cj",z-il);
+					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_l("cl",ih-il);
+
+					Aauxadd.push(oauxadd,&req_i);
+					Aauxadd.push(oauxadd,&req_n);
+					Aauxadd.push(oauxadd,&req_j);
+					Aauxadd.push(oauxadd,&req_l);
+					for ( uint64_t i = 0; i < oauxcopy; ++i )
+						Aauxadd.push(oauxadd,&Aauxcopy[i]);
+
+					// MD,NM,AS,ci,cn,cj,cl
+
+					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &Aauxadd[0];
+					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &Aauxadd[oauxadd];
+
+					try
+					{
+						if ( ! inverse )
+						{
+							context.converter.convert(
+								P.first,
+								reinterpret_cast<char const *>((package.refdb)->bases) + (package.refdb)->reads[aread].boff,
+								(package.refdb)->reads[aread].rlen,
+								reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff,
+								(package.readsdb)->reads[bread].rlen,
+								readname,
+								context.fragment,
+								secondary,
+								supplementary,
+								**(package.Pbamheader),
+								aux_a,
+								aux_e
+							);
+						}
+						else
+						{
+							context.converter.convert(
+								P.first,
+								reinterpret_cast<char const *>((package.refdb)->bases) + (package.refdb)->reads[aread].boff,
+								(package.refdb)->reads[aread].rlen,
+								context.ARC.begin()+1 /* skip terminator */,
+								readlen,
+								readname,
+								context.fragment,
+								secondary,
+								supplementary,
+								**(package.Pbamheader),
+								aux_a,
+								aux_e
+							);
+						}
+					}
+					catch(std::exception const & ex)
+					{
+						std::cerr << ex.what() << std::endl;
+						std::cerr
+							<< aread << " "
+							<< bread << " "
+							<< flags
+							<< std::endl;
 					}
 				}
-
-				#if 0
-				if ( pbam )
-				{
-					std::cerr << readname << "\t" << libmaus2::bambam::BamAlignmentDecoderBase::getReadName(pbam) << std::endl;
-				}
-				#endif
-
-				bool const supplementary = (z != il);
-
-				// bool const primary = libmaus2::dazzler::align::OverlapData::getPrimaryFlag(P.first);
-				uint64_t const readlen = (package.readsdb)->reads[bread].rlen;
-
-				if ( z==ilow )
-				{
-					// compute reverse complement
-					context.ARC.ensureSize(readlen + 2);
-
-					char * const ra = context.ARC.begin();
-					char * rp = ra + readlen + 2;
-					char const * src = reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff - 1;
-
-					*(--rp)	= (*(src++));
-					while ( rp != ra+1 )
-						*(--rp)	= (*(src++)) ^ 3;
-					*(--rp)	= (*(src++));
-				}
-
-				uint64_t oauxadd = 0;
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_i("ci",lchainid);
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_n("cn",numchains);
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_j("cj",z-il);
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_l("cl",ih-il);
-
-				Aauxadd.push(oauxadd,&req_i);
-				Aauxadd.push(oauxadd,&req_n);
-				Aauxadd.push(oauxadd,&req_j);
-				Aauxadd.push(oauxadd,&req_l);
-				for ( uint64_t i = 0; i < oauxcopy; ++i )
-					Aauxadd.push(oauxadd,&Aauxcopy[i]);
-
-				// MD,NM,AS,ci,cn,cj,cl
-
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &Aauxadd[0];
-				libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &Aauxadd[oauxadd];
-
-				try
-				{
-					if ( ! inverse )
-					{
-						context.converter.convert(
-							P.first,
-							reinterpret_cast<char const *>((package.refdb)->bases) + (package.refdb)->reads[aread].boff,
-							(package.refdb)->reads[aread].rlen,
-							reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff,
-							(package.readsdb)->reads[bread].rlen,
-							readname,
-							context.fragment,
-							secondary,
-							supplementary,
-							**(package.Pbamheader),
-							aux_a,
-							aux_e
-						);
-					}
-					else
-					{
-						context.converter.convert(
-							P.first,
-							reinterpret_cast<char const *>((package.refdb)->bases) + (package.refdb)->reads[aread].boff,
-							(package.refdb)->reads[aread].rlen,
-							context.ARC.begin()+1 /* skip terminator */,
-							readlen,
-							readname,
-							context.fragment,
-							secondary,
-							supplementary,
-							**(package.Pbamheader),
-							aux_a,
-							aux_e
-						);
-					}
-				}
-				catch(std::exception const & ex)
-				{
-					std::cerr << ex.what() << std::endl;
-					std::cerr
-						<< aread << " "
-						<< bread << " "
-						<< flags
-						<< std::endl;
-				}
-			}
-
 
 			il = ih;
 		}
@@ -2487,6 +2491,8 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	// default k
 	unsigned int const defk = 20;
 	unsigned int const k = arg.argPresent("k") ? arg.getUnsignedNumericArg<uint64_t>("k") : defk;
+
+	bool const encodesecondary = !(arg.argPresent("Z"));
 
 	// verbosity
 	unsigned int const defv = 1;
@@ -3509,7 +3515,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 				{
 					VEB[zr-1] = GenericWorkPackage < PackageEncodeBam >(
 						0,EncodeBamDispatcher_id,
-						PackageEncodeBam(zr,&ointv,&Acontexts,&OVLdata,prevmark,&Areadnames,&Pbamheader,&O,&refdb,&readsdb,&Abam,&Obam,oobam,&finsem)
+						PackageEncodeBam(zr,&ointv,&Acontexts,&OVLdata,prevmark,&Areadnames,&Pbamheader,&O,&refdb,&readsdb,&Abam,&Obam,oobam,encodesecondary,&finsem)
 					);
 					STP.enque(&VEB[zr-1]);
 				}
@@ -3720,6 +3726,7 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " -S: storage strategy for non primary alignments (none, soft, hard)\n";
 	ostr << " -z: output BAM compression level (zlib default)\n";
 	ostr << " -I: input format (fasta (default) or bam)\n";
+	ostr << " -Z: do not encode secondary alignments (default: encode secondary)\n";
 
 	return ostr.str();
 }
