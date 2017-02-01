@@ -1,3 +1,9 @@
+damapper-bwt (0.0.12-1) unstable; urgency=medium
+
+  * add -Z flag (do not encode secondary alignments)
+
+ -- German Tischler <tischler@mpi-cbg.de>  Wed, 01 Feb 2017 17:44:05 +0100
+
 damapper-bwt (0.0.11-1) unstable; urgency=medium
 
   * update libmaus2 dependency
