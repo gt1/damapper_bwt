@@ -2567,6 +2567,17 @@ enum dispatcher_ids
 
 int damapper_bwt(libmaus2::util::ArgParser const & arg)
 {
+	// verbosity
+	unsigned int const defv = 1;
+	unsigned int const verbose = arg.argPresent("v") ? arg.getUnsignedNumericArg<uint64_t>("v") : defv;
+
+	if ( verbose > 0 )
+	{
+		std::cerr << "[V] This is " << PACKAGE << " version " << PACKAGE_VERSION << std::endl;
+		arg.printArgs(std::cerr,std::string("[V] "));
+		std::cerr << "[V] CL " << arg.commandlinecoded << std::endl;
+	}
+
 	// default k
 	unsigned int const defk = 20;
 	unsigned int const k = arg.argPresent("k") ? arg.getUnsignedNumericArg<uint64_t>("k") : defk;
@@ -2596,9 +2607,6 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	uint64_t const randomseed = arg.argPresent("randomseed") ? arg.getUnsignedNumericArg<uint64_t>("randomseed") : time(0);
 	libmaus2::random::Random::setup(randomseed);
 
-	// verbosity
-	unsigned int const defv = 1;
-	unsigned int const verbose = arg.argPresent("v") ? arg.getUnsignedNumericArg<uint64_t>("v") : defv;
 
 	// maximum number of input bases per block
 	uint64_t const defo = 256*1024*1024;
