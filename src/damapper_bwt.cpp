@@ -81,6 +81,7 @@
 #include <libmaus2/bambam/ProgramHeaderLineSet.hpp>
 #include <libmaus2/lz/BgzfDeflateOutputBufferBase.hpp>
 #include <libmaus2/parallel/LockedGrowingFreeList.hpp>
+#include <libmaus2/hashing/hash.hpp>
 
 static int getDefaultLevel() { return Z_DEFAULT_COMPRESSION; }
 
@@ -1841,6 +1842,12 @@ struct LASToBamContext
 	}
 };
 
+enum primary_strategy
+{
+	primary_strategy_first_best,
+	primary_strategy_random_best
+};
+
 struct PackageEncodeBam
 {
 	uint64_t zr;
@@ -1859,6 +1866,8 @@ struct PackageEncodeBam
 	uint64_t oobam;
 
 	bool encodesecondary;
+
+	primary_strategy primstrat;
 
 	libmaus2::parallel::PosixSemaphore *finsem;
 
@@ -1879,10 +1888,11 @@ struct PackageEncodeBam
 		libmaus2::autoarray::AutoArray< uint64_t > * rObam,
 		uint64_t roobam,
 		bool const rencodesecondary,
+		primary_strategy const rprimstrat,
 		libmaus2::parallel::PosixSemaphore *rfinsem
 	) : zr(rzr), ointv(rointv), Acontexts(rAcontexts), OVLdata(rOVLdata), prevmark(rprevmark), Areadnames(rAreadnames),
 	    Pbamheader(rPbamheader), O(rO), refdb(rrefdb), readsdb(rreadsdb), Abam(rAbam), Obam(rObam), oobam(roobam),
-	    encodesecondary(rencodesecondary), finsem(rfinsem)
+	    encodesecondary(rencodesecondary), primstrat(rprimstrat), finsem(rfinsem)
 	{
 
 	}
@@ -1922,6 +1932,8 @@ static void threadEncodeBam(PackageEncodeBam package)
 		int64_t const refbread = libmaus2::dazzler::align::OverlapData::getBRead((package.OVLdata)->getData(ilow).first);
 		while ( ihigh < rhigh && libmaus2::dazzler::align::OverlapData::getBRead((package.OVLdata)->getData(ihigh).first) == refbread )
 			++ihigh;
+
+		assert ( ihigh > ilow );
 
 		while ( nextexpt < refbread )
 		{
@@ -1986,19 +1998,105 @@ static void threadEncodeBam(PackageEncodeBam package)
 			bamlen = package.Obam->at(refbread+1)-package.Obam->at(refbread);
 		}
 
-		uint64_t il = ilow;
-		uint64_t chainid = 0;
-		while ( il < ihigh )
+		struct ChainInfo
 		{
-			uint64_t ih = il+1;
-			while (
-				ih < ihigh
-				&&
-				(!libmaus2::dazzler::align::OverlapData::getStartFlag((package.OVLdata)->getData(ih).first))
-			)
-				++ih;
+			uint64_t from;
+			uint64_t to;
+			bool best;
+			int64_t rank;
 
-			uint64_t const lchainid = chainid++;
+			ChainInfo()
+			{}
+
+			ChainInfo(uint64_t const rfrom, uint64_t const rto, bool const rbest, int64_t rrank)
+			: from(rfrom), to(rto), best(rbest), rank(rrank) {}
+
+			bool operator<(ChainInfo const & O) const
+			{
+				return rank < O.rank;
+			}
+		};
+
+		// compute chains
+		uint64_t jl = ilow;
+		std::vector<ChainInfo> VCI;
+		std::vector<ChainInfo> VCIB;
+		while ( jl < ihigh )
+		{
+			uint64_t jh = jl + 1;
+
+			while (
+				jh < ihigh
+				&&
+				(!libmaus2::dazzler::align::OverlapData::getStartFlag((package.OVLdata)->getData(jh).first))
+			)
+				++jh;
+
+			uint64_t const rank = VCI.size();
+			VCI.push_back(ChainInfo(jl,jh,libmaus2::dazzler::align::OverlapData::getBestFlag((package.OVLdata)->getData(jl).first),rank));
+			if ( VCI.back().best )
+				VCIB.push_back(VCI.back());
+
+			jl = jh;
+		}
+
+		assert ( VCI.size() );
+		int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead((package.OVLdata)->getData(VCI.front().from).first);
+		uint64_t const readlen = (package.readsdb)->reads[bread].rlen;
+		char const * const readname = (package.Areadnames)->begin() + (*(package.O))[bread].nameoff;
+
+		switch ( package.primstrat )
+		{
+			case primary_strategy_first_best:
+				if ( VCIB.size() )
+				{
+					uint64_t const rank = VCIB[0].rank;
+					assert ( rank < VCI.size() );
+					VCI.at(rank).rank = -1;
+				}
+				break;
+			case primary_strategy_random_best:
+				if ( VCIB.size() )
+				{
+					// uint64_t const randrank = libmaus2::random::Random::rand64() % VCIB.size();
+
+					uint64_t const randrank = libmaus2::hashing::EvaHash::hash64(reinterpret_cast<uint8_t const *>(readname),strlen(readname)) % VCIB.size();
+
+					uint64_t const rank = VCIB.at(randrank).rank;
+					#if 0
+					if ( VCIB.size() > 1 )
+						std::cerr << "selected " << rank << "/" << VCIB.size() << std::endl;
+					#endif
+					assert ( rank < VCI.size() );
+					VCI.at(rank).rank = -1;
+				}
+				break;
+			default:
+				break;
+		}
+
+		std::sort(VCI.begin(),VCI.end());
+
+
+		{
+			// compute reverse complement
+			context.ARC.ensureSize(readlen + 2);
+
+			char * const ra = context.ARC.begin();
+			char * rp = ra + readlen + 2;
+			char const * src = reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff - 1;
+
+			*(--rp)	= (*(src++));
+			while ( rp != ra+1 )
+				*(--rp)	= (*(src++)) ^ 3;
+			*(--rp)	= (*(src++));
+		}
+
+		for ( uint64_t lchainid = 0; lchainid < VCI.size(); ++lchainid )
+		{
+			uint64_t const il = VCI[lchainid].from;
+			uint64_t const ih = VCI[lchainid].to;
+
 			bool const secondary = (lchainid > 0);
 
 			if ( (!secondary) || package.encodesecondary )
@@ -2007,10 +2105,9 @@ static void threadEncodeBam(PackageEncodeBam package)
 					std::pair<uint8_t const *, uint8_t const *> const P = (package.OVLdata)->getData(z);
 
 					int64_t const aread = libmaus2::dazzler::align::OverlapData::getARead(P.first);
-					int64_t const bread = libmaus2::dazzler::align::OverlapData::getBRead(P.first);
+					assert ( bread == libmaus2::dazzler::align::OverlapData::getBRead(P.first) );
 					int64_t const flags = libmaus2::dazzler::align::OverlapData::getFlags(P.first);
 					bool const inverse = libmaus2::dazzler::align::OverlapData::getInverseFlag(P.first);
-					char const * readname = (package.Areadnames)->begin() + (*(package.O))[bread].nameoff;
 
 					uint64_t oauxcopy = 0;
 					if ( pbam )
@@ -2037,22 +2134,6 @@ static void threadEncodeBam(PackageEncodeBam package)
 					bool const supplementary = (z != il);
 
 					// bool const primary = libmaus2::dazzler::align::OverlapData::getPrimaryFlag(P.first);
-					uint64_t const readlen = (package.readsdb)->reads[bread].rlen;
-
-					if ( z==ilow )
-					{
-						// compute reverse complement
-						context.ARC.ensureSize(readlen + 2);
-
-						char * const ra = context.ARC.begin();
-						char * rp = ra + readlen + 2;
-						char const * src = reinterpret_cast<char const *>((package.readsdb)->bases) + (package.readsdb)->reads[bread].boff - 1;
-
-						*(--rp)	= (*(src++));
-						while ( rp != ra+1 )
-							*(--rp)	= (*(src++)) ^ 3;
-						*(--rp)	= (*(src++));
-					}
 
 					uint64_t oauxadd = 0;
 					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagIntegerAddRequest req_i("ci",lchainid);
@@ -2119,8 +2200,6 @@ static void threadEncodeBam(PackageEncodeBam package)
 							<< std::endl;
 					}
 				}
-
-			il = ih;
 		}
 
 		nextexpt += 1;
@@ -2493,6 +2572,29 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	unsigned int const k = arg.argPresent("k") ? arg.getUnsignedNumericArg<uint64_t>("k") : defk;
 
 	bool const encodesecondary = !(arg.argPresent("Z"));
+
+	primary_strategy primstrat;
+
+	std::string const sprimstrat = arg.argPresent("P") ? arg["P"] : "randombest";
+
+	if ( sprimstrat == "randombest" )
+	{
+		primstrat = primary_strategy_random_best;
+	}
+	else if ( sprimstrat == "firstbest" )
+	{
+		primstrat = primary_strategy_first_best;
+	}
+	else
+	{
+		libmaus2::exception::LibMausException lme;
+		lme.getStream() << "[E] unknown primary selection strategy " << sprimstrat << std::endl;
+		lme.finish();
+		throw lme;
+	}
+
+	uint64_t const randomseed = arg.argPresent("randomseed") ? arg.getUnsignedNumericArg<uint64_t>("randomseed") : time(0);
+	libmaus2::random::Random::setup(randomseed);
 
 	// verbosity
 	unsigned int const defv = 1;
@@ -3515,7 +3617,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 				{
 					VEB[zr-1] = GenericWorkPackage < PackageEncodeBam >(
 						0,EncodeBamDispatcher_id,
-						PackageEncodeBam(zr,&ointv,&Acontexts,&OVLdata,prevmark,&Areadnames,&Pbamheader,&O,&refdb,&readsdb,&Abam,&Obam,oobam,encodesecondary,&finsem)
+						PackageEncodeBam(zr,&ointv,&Acontexts,&OVLdata,prevmark,&Areadnames,&Pbamheader,&O,&refdb,&readsdb,&Abam,&Obam,oobam,encodesecondary,primstrat,&finsem)
 					);
 					STP.enque(&VEB[zr-1]);
 				}
@@ -3727,6 +3829,8 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " -z: output BAM compression level (zlib default)\n";
 	ostr << " -I: input format (fasta (default) or bam)\n";
 	ostr << " -Z: do not encode secondary alignments (default: encode secondary)\n";
+	ostr << " -P: selection strategy for primary alignment (randombest (default) or firstbest)\n";
+	ostr << "\n";
 
 	return ostr.str();
 }

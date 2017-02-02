@@ -67,6 +67,7 @@ The following parameters can be used (no space allowed between option an argumen
 * -z: output BAM compression level (zlib default)
 * -I: input format (fasta (default) or bam)
 * -Z: do not encode secondary alignments (default: report secondary hits)
+* -P: selection strategy for primary alignment (randombest (default) or firstbest)
 
 BAM output files
 ----------------
@@ -94,3 +95,16 @@ each output alignment contains the complete query sequence.
 
 If the input is given in BAM format, then damapper_bwt will copy read group (RG) identifiers and other auxiliary tags from
 the input to the output file.
+
+Producing alignments for quiver/arrow
+-------------------------------------
+
+damapper_bwt can produce alignments suitable for use with quiver and arrow (see https://github.com/PacificBiosciences/GenomicConsensus).
+For this purpose the input needs to be in BAM format and follow PacBio's BAM specifications (cf. http://pacbiofileformats.readthedocs.io/en/3.0/BAM.html).
+The bax2bam utility distributed with blasr (see https://github.com/PacificBiosciences/blasr) can be used to convert H5 read files to this BAM format.
+damapper_bwt needs to be run with options -Ssoft -Ibam -Z. An example call is
+
+	damapper_bwt -Ssoft -Ibam -Z ref.fasta <in.bam >out.bam
+
+The resulting file needs to be sorted in coordinate order (use biobambam2's bamsormadup (see https://github.com/gt1/biobambam2) or samtools sort)
+and indexed using pbindex (this program is contained in the pbbam package at https://github.com/PacificBiosciences/pbbam).
