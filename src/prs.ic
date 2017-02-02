@@ -1,1 +1,754 @@
-../damapper/prs.ic
+/*
+
+Copyright (c) 2015, German Tischler (tischler@mpi-cbg.de)
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. The name of German Tischler may not be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+   ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+   WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+   ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+   (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+   LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+   ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+*/
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+#define PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS ((size_t)0x100ul)
+#define PARALLEL_INTERLEAVED_RADIX_SORT_SWAP(a,b,t) do { t=a; a=b; b=t; } while(0);
+
+static size_t prefixSums(size_t * ita, size_t * const ite, size_t const d)
+{
+	size_t s = 0;
+
+	while ( ita != ite )
+	{
+		size_t const t = *ita;
+		*ita = s;
+		ita += d;
+		s += t;
+	}
+
+	return s;
+}
+
+typedef struct _PARALLEL_INTERLEAVED_RADIX_SORT_SYNC
+{
+	size_t volatile c;
+	int mutex_init_complete;
+	pthread_mutex_t mutex;
+	int cond_init_complete;
+	pthread_cond_t cond;
+} PARALLEL_INTERLEAVED_RADIX_SORT_SYNC;
+
+typedef struct _PARALLEL_INTERLEAVED_RADIX_SORT_PACKAGEHEADER
+{
+	void (*dispatcher)(void *);
+	PARALLEL_INTERLEAVED_RADIX_SORT_SYNC *sync;
+} PARALLEL_INTERLEAVED_RADIX_SORT_PACKAGEHEADER;
+
+static PARALLEL_INTERLEAVED_RADIX_SORT_SYNC * PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_DESTROY(PARALLEL_INTERLEAVED_RADIX_SORT_SYNC * object)
+{
+	if ( object )
+	{
+		if ( object->cond_init_complete )
+			pthread_cond_destroy(&(object->cond));
+		if ( object->mutex_init_complete )
+			pthread_mutex_destroy(&(object->mutex));
+		free(object);
+	}
+
+	return 0;
+}
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_SIGNAL(PARALLEL_INTERLEAVED_RADIX_SORT_SYNC * object)
+{
+	pthread_mutex_lock(&(object->mutex));
+	pthread_cond_signal(&(object->cond));
+	object->c += 1;
+	pthread_mutex_unlock(&(object->mutex));
+
+}
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_WAIT(PARALLEL_INTERLEAVED_RADIX_SORT_SYNC * object)
+{
+	pthread_mutex_lock(&(object->mutex));
+
+	while ( !(object->c) )
+		pthread_cond_wait(&(object->cond),&(object->mutex));
+
+	object->c -= 1;
+
+	pthread_mutex_unlock(&(object->mutex));
+}
+
+static PARALLEL_INTERLEAVED_RADIX_SORT_SYNC * PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_ALLOC()
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_SYNC * object = 0;
+
+	object = (PARALLEL_INTERLEAVED_RADIX_SORT_SYNC *)malloc(sizeof(PARALLEL_INTERLEAVED_RADIX_SORT_SYNC));
+	if ( ! object )
+		return PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_DESTROY(object);
+
+	object->c = 0;
+	object->mutex_init_complete = 0;
+	object->cond_init_complete = 0;
+
+	if ( pthread_mutex_init(&(object->mutex),0) != 0 )
+		return PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_DESTROY(object);
+	else
+		object->mutex_init_complete = 1;
+
+	if ( pthread_cond_init(&(object->cond),0) )
+		return PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_DESTROY(object);
+	else
+		object->cond_init_complete = 1;
+
+	return object;
+}
+
+typedef struct _PARALLEL_INTERLEAVED_RADIX_SORT_HISTOGRAM_PACKAGE
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_PACKAGEHEADER header;
+
+	size_t t;
+	size_t packsize;
+	size_t n;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * ita;
+	size_t * Ahist;
+	size_t key_offset_0;
+} PARALLEL_INTERLEAVED_RADIX_SORT_HISTOGRAM_PACKAGE;
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_HISTOGRAM_PACKAGE(void * rpackage)
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_HISTOGRAM_PACKAGE * package =
+		(PARALLEL_INTERLEAVED_RADIX_SORT_HISTOGRAM_PACKAGE *)rpackage;
+	size_t const p_low = package->t * package->packsize;
+	size_t const p_high = p_low+package->packsize <= package->n ? p_low+package->packsize : package->n;
+	unsigned int const key_offset_0 = package->key_offset_0;
+
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * p_ita = package->ita + p_low;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * p_ite = package->ita + p_high;
+
+	size_t * const hist = package->Ahist + package->t * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS;
+
+	size_t i;
+
+	for ( i = 0; i < PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS; ++i )
+		hist[i] = 0;
+
+	while ( p_ita != p_ite )
+		hist[ ((uint8_t const *)(p_ita++))[key_offset_0] ] ++;
+}
+
+typedef struct _PARALLEL_INTERLEAVED_RADIX_SORT_SORT_PACKAGE
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_PACKAGEHEADER header;
+
+	size_t t;
+	size_t numthreads;
+	size_t packsize;
+	size_t n;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * ita;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * tita;
+	size_t * Ahist;
+	size_t * Athist;
+	size_t key_offset_0;
+	size_t key_offset_1;
+} PARALLEL_INTERLEAVED_RADIX_SORT_SORT_PACKAGE;
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_SORT_PACKAGE(void * rpackage)
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_SORT_PACKAGE * package =
+		(PARALLEL_INTERLEAVED_RADIX_SORT_SORT_PACKAGE *)rpackage;
+	size_t const p_low = package->t * package->packsize;
+	size_t const p_high = (p_low+package->packsize <= package->n) ? (p_low+package->packsize) : package->n;
+
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * p_ita = package->ita + p_low;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * p_ite = package->ita + p_high;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * tita = package->tita;
+
+	size_t * const Athist = package->Athist;
+	size_t * const hist = package->Ahist + package->t * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS;
+	size_t * const thist = package->Athist + package->t /* in block */ *package->numthreads*PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS;
+
+	unsigned int const key_offset_0 = package->key_offset_0;
+	unsigned int const key_offset_1 = package->key_offset_1;
+	size_t const packsize = package->packsize;
+
+	size_t * p;
+
+	for ( p = Athist + (package->t+0)*package->numthreads*PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS;
+		p != Athist + (package->t+1)*package->numthreads*PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS;
+		++p )
+		*p = 0;
+
+	while ( p_ita != p_ite )
+	{
+		uint8_t const * kp = ((uint8_t const *)(p_ita));
+		size_t const bucket      = kp[key_offset_0];
+		size_t const next_bucket = kp[key_offset_1];
+		size_t const outpos      = hist[bucket]++;
+		size_t const outpack     = outpos / packsize;
+		thist [ outpack /* out block */ * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS + next_bucket ] ++;
+		tita[outpos] = *(p_ita);
+		p_ita++;
+	}
+
+}
+
+typedef struct _PARALLEL_INTERLEAVED_RADIX_SORT_HISTACC_PACKAGE
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_PACKAGEHEADER header;
+
+	size_t t;
+	size_t numthreads;
+	size_t * Ahist;
+	size_t * Athist;
+} PARALLEL_INTERLEAVED_RADIX_SORT_HISTACC_PACKAGE;
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_HISTACC_PACKAGE(void * rpackage)
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_HISTACC_PACKAGE * package =
+		(PARALLEL_INTERLEAVED_RADIX_SORT_HISTACC_PACKAGE *)rpackage;
+	size_t const t = package->t;
+	size_t * Athist = package->Athist;
+	size_t * Ahist = package->Ahist;
+	size_t const numthreads = package->numthreads;
+
+	size_t * const hist = Ahist + t * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS;
+
+	size_t i;
+
+	for ( i = 0; i < PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS; ++i )
+	{
+		size_t p;
+		hist[i] = 0;
+		for ( p = 0; p < numthreads; ++p )
+			hist[i] += Athist[p /* in block */ *numthreads*PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS + t /* out block */ *PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS + i /* bucket */];
+	}
+
+}
+
+typedef struct _PARALLEL_INTERLEAVED_RADIX_SORT_FINALSORT_PACKAGE
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_PACKAGEHEADER header;
+
+	size_t t;
+	size_t packsize;
+	size_t n;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * ita;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * tita;
+	size_t * Ahist;
+	size_t key_offset_0;
+} PARALLEL_INTERLEAVED_RADIX_SORT_FINALSORT_PACKAGE;
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_FINALSORT_PACKAGE(void * rpackage)
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_FINALSORT_PACKAGE * package =
+		(PARALLEL_INTERLEAVED_RADIX_SORT_FINALSORT_PACKAGE *)rpackage;
+	size_t const t = package->t;
+	size_t const packsize = package->packsize;
+	size_t const n = package->n;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * ita = package->ita;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * tita = package->tita;
+	size_t * Ahist = package->Ahist;
+	unsigned int const key_offset_0 = package->key_offset_0;
+
+	size_t const p_low = t * packsize;
+	size_t const p_high = (p_low+packsize<=n)?(p_low+packsize):n;
+
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * p_ita = ita + p_low;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * p_ite = ita + p_high;
+
+	size_t * const hist = Ahist + t * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS;
+
+	while ( p_ita != p_ite )
+	{
+		size_t const bucket      = ((uint8_t const *)(p_ita))[key_offset_0];
+		size_t const outpos      = hist[bucket]++;
+		tita[outpos] = *(p_ita);
+		p_ita++;
+	}
+
+}
+
+static void * PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_PACKAGE(void * package)
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_PACKAGEHEADER * header =
+		(PARALLEL_INTERLEAVED_RADIX_SORT_PACKAGEHEADER *)package;
+	typedef void (*dispatcher_type)(void *);
+	dispatcher_type dispatcher = header->dispatcher;
+	dispatcher(package);
+	PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_SIGNAL(header->sync);
+	return 0;
+}
+
+typedef struct _PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL
+{
+	size_t numthreads;
+	void ** packages;
+	size_t volatile packagesfilled;
+
+	void * volatile * volatile packages_cur;
+
+	int mutex_init_complete;
+	pthread_mutex_t	mutex;
+	int cond_init_complete;
+	pthread_cond_t cond;
+
+	int * threadsstarted;
+	pthread_t ** threads;
+
+	PARALLEL_INTERLEAVED_RADIX_SORT_SYNC * sync;
+} PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL;
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_WAITSYNC(PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * sortcontrol)
+{
+	size_t i;
+	for ( i = 0; i < sortcontrol->numthreads; ++i )
+		PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_WAIT(sortcontrol->sync);
+}
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ENQUEUE(PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * sortcontrol, void * package)
+{
+	pthread_mutex_lock(&(sortcontrol->mutex));
+	pthread_cond_signal(&(sortcontrol->cond));
+	sortcontrol->packagesfilled += 1;
+	*(sortcontrol->packages_cur++) = package;
+	pthread_mutex_unlock(&(sortcontrol->mutex));
+}
+
+static void PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_TERM(PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * sortcontrol)
+{
+	size_t i;
+	for ( i = 0; i < sortcontrol->numthreads; ++i )
+		PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ENQUEUE(sortcontrol,0);
+}
+
+static void * PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_DEQUEUE(PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * sortcontrol)
+{
+	void * package = 0;
+
+	pthread_mutex_lock(&(sortcontrol->mutex));
+
+	while ( 1 )
+	{
+		if ( sortcontrol->packagesfilled )
+		{
+			package = *(--(sortcontrol->packages_cur));
+			sortcontrol->packagesfilled -= 1;
+			break;
+		}
+		else
+		{
+			pthread_cond_wait(&(sortcontrol->cond),&(sortcontrol->mutex));
+		}
+	}
+
+	pthread_mutex_unlock(&(sortcontrol->mutex));
+
+	return package;
+}
+
+static PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_DESTROY(PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * sortcontrol)
+{
+	if ( sortcontrol )
+	{
+		if ( sortcontrol->threads )
+		{
+			size_t i;
+
+			for ( i = 0; i < sortcontrol->numthreads; ++i )
+				if ( sortcontrol->threadsstarted[i] )
+				{
+					void * r = 0;
+					pthread_join(*(sortcontrol->threads[i]),&r);
+				}
+			for ( i = 0; i < sortcontrol->numthreads; ++i )
+				if ( sortcontrol->threads[i] )
+					free(sortcontrol->threads[i]);
+			free(sortcontrol->threads);
+		}
+		if ( sortcontrol->threadsstarted )
+			free(sortcontrol->threadsstarted);
+		if ( sortcontrol->cond_init_complete )
+			pthread_cond_destroy(&(sortcontrol->cond));
+		if ( sortcontrol->mutex_init_complete )
+			pthread_mutex_destroy(&(sortcontrol->mutex));
+		if ( sortcontrol->packages )
+			free(sortcontrol->packages);
+		if ( sortcontrol->sync )
+			PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_DESTROY(sortcontrol->sync);
+		free(sortcontrol);
+	}
+
+	return 0;
+}
+
+
+static void * PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCHER_THREAD(void * arg)
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * sortcontrol =
+		(PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL *)arg;
+
+	void * package = 0;
+	while ( (package=PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_DEQUEUE(sortcontrol)) )
+		PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_PACKAGE(package);
+
+	return 0;
+}
+
+static PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ALLOC(size_t const numthreads)
+{
+	PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * sortcontrol = 0;
+	size_t i;
+
+	sortcontrol = (PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL *)malloc(sizeof(PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL));
+	if ( ! sortcontrol )
+		goto failure;
+
+	sortcontrol->numthreads = numthreads;
+	sortcontrol->packagesfilled = 0;
+	sortcontrol->mutex_init_complete = 0;
+	sortcontrol->cond_init_complete = 0;
+	sortcontrol->threads = 0;
+	sortcontrol->threadsstarted = 0;
+	sortcontrol->sync = 0;
+
+	sortcontrol->packages = (void **)malloc(numthreads * sizeof(void *));
+	if ( ! sortcontrol->packages )
+		goto failure;
+
+	if ( pthread_mutex_init(&(sortcontrol->mutex),0) != 0 )
+		goto failure;
+	else
+		sortcontrol->mutex_init_complete = 1;
+
+	if ( pthread_cond_init(&(sortcontrol->cond),0) != 0 )
+		goto failure;
+	else
+		sortcontrol->cond_init_complete = 1;
+
+	sortcontrol->sync = PARALLEL_INTERLEAVED_RADIX_SORT_SYNC_ALLOC();
+	if ( ! sortcontrol->sync )
+		goto failure;
+
+	sortcontrol->packages_cur = sortcontrol->packages;
+
+	sortcontrol->threadsstarted = (int *)malloc(numthreads * sizeof(int));
+	for ( i = 0; i < numthreads; ++i )
+		sortcontrol->threadsstarted[i] = 0;
+	sortcontrol->threads = (pthread_t **)malloc(numthreads * sizeof(pthread_t *));
+	if ( ! sortcontrol->threads )
+		goto failure;
+	for ( i = 0; i < sortcontrol->numthreads; ++i )
+		sortcontrol->threads[i] = 0;
+	for ( i = 0; i < sortcontrol->numthreads; ++i )
+	{
+		sortcontrol->threads[i] = (pthread_t *)malloc(sizeof(pthread_t));
+		if ( ! sortcontrol->threads[i] )
+			goto failure;
+	}
+	for ( i = 0; i < sortcontrol->numthreads; ++i )
+	{
+		if (
+			pthread_create(
+				sortcontrol->threads[i],
+				0 /* attr */,
+				PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCHER_THREAD,
+				sortcontrol
+			)
+			!=
+			0
+		)
+		{
+			size_t j;
+			for ( j = 0; j < i; ++j )
+				PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ENQUEUE(sortcontrol,0);
+			goto failure;
+		}
+		else
+		{
+			sortcontrol->threadsstarted[i] = 1;
+		}
+	}
+	return sortcontrol;
+
+	failure:
+	return PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_DESTROY(sortcontrol);
+}
+
+/**
+ * radix sort using byte key access. The input sequence of length n is expected in [ita,ita+n).
+ * The range [tita,tita+n) is used as temporary space. The sorting will use up to tnumthreads
+ * threads (tnumthreads whenever n is at least tnumthreads). The routine performs rounds iterations
+ * of bucket sorting where the k'th round extracts byte keybytes[k] from the objects to be sorted.
+ * The sorted sequence is stored in [ita,ite) if rounds is even and [tita,tite) if rounds is odd.
+ * The function will compute the histogram for the next round inside the current round when
+ * interleave is set to one, otherwise the byte histogram for a round is computed in a separate scan.
+ * As setting interleave to 1 uses one division operation per element this is often slower
+ * than performing another linear scan, although it reduces the amount of memory accesses.
+ **/
+int PARALLEL_INTERLEAVED_RADIX_SORT_FUNCTIONNAME(
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * ita,
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * tita,
+	size_t const n,
+	unsigned int const tnumthreads,
+	unsigned int const rounds,
+	unsigned int const * keybytes,
+	int const interleave
+)
+{
+	int returncode = 0;
+	size_t const packsize = (n + tnumthreads - 1) / tnumthreads;
+	size_t const numthreads = (n + packsize - 1) / packsize;
+	size_t * Ahist = 0;
+	size_t * Athist = 0;
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * it_swap_tmp = 0;
+	char * packagespace = 0;
+	PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL * sortcontrol = 0;
+
+	static size_t const thread_package_sizes[] = {
+		sizeof(PARALLEL_INTERLEAVED_RADIX_SORT_HISTOGRAM_PACKAGE),
+		sizeof(PARALLEL_INTERLEAVED_RADIX_SORT_SORT_PACKAGE),
+		sizeof(PARALLEL_INTERLEAVED_RADIX_SORT_HISTACC_PACKAGE),
+		sizeof(PARALLEL_INTERLEAVED_RADIX_SORT_FINALSORT_PACKAGE),
+		0
+	};
+
+	size_t max_thread_package_size = 0;
+	size_t const * p;
+	unsigned int r;
+
+	for ( p = &thread_package_sizes[0]; *p; ++p )
+		if ( *p > max_thread_package_size )
+			max_thread_package_size = *p;
+
+	packagespace = (char *)malloc(numthreads * max_thread_package_size);
+	if ( ! packagespace )
+	{
+		returncode = -1;
+		goto cleanup;
+	}
+
+	Ahist = (size_t *)malloc((numthreads+1) * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS*sizeof(size_t));
+	if ( ! Ahist )
+	{
+		returncode = -1;
+		goto cleanup;
+	}
+	Athist = (size_t *)malloc(numthreads*numthreads* PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS*sizeof(size_t));
+	if ( ! Athist )
+	{
+		returncode = -1;
+		goto cleanup;
+	}
+
+	sortcontrol = PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ALLOC(numthreads);
+	if ( ! sortcontrol )
+	{
+		returncode = -1;
+		goto cleanup;
+	}
+
+	for ( r = 0; r < rounds; ++r )
+	{
+		size_t i;
+
+		/*
+		 * compute bucket histograms if first round or no interleaving
+		 */
+		if ( (r == 0) || (!interleave) )
+		{
+			unsigned int const key_offset_0 = keybytes[r];
+			size_t t;
+
+			for ( t = 0; t < numthreads; ++t )
+			{
+				PARALLEL_INTERLEAVED_RADIX_SORT_HISTOGRAM_PACKAGE * package =
+					(PARALLEL_INTERLEAVED_RADIX_SORT_HISTOGRAM_PACKAGE *)packagespace + t;
+
+				package->header.dispatcher = PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_HISTOGRAM_PACKAGE;
+				package->header.sync = sortcontrol->sync;
+				package->t = t;
+				package->packsize = packsize;
+				package->n = n;
+				package->ita = ita;
+				package->Ahist = Ahist;
+				package->key_offset_0 = key_offset_0;
+
+				PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ENQUEUE(sortcontrol,package);
+			}
+
+			PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_WAITSYNC(sortcontrol);
+		}
+
+		/* compute prefix sums for each bucket over blocks */
+		for ( i = 0; i < PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS; ++i )
+			prefixSums(Ahist + i,Ahist + i + (numthreads+1) * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS,PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS);
+
+		/* compute prefix sums over whole data set */
+		prefixSums(Ahist + (numthreads+0) * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS,Ahist + (numthreads+1) * PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS,1);
+
+		for ( i = 0; i < PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS; ++i )
+		{
+			size_t const a = Ahist[(numthreads+0)*PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS+i];
+			size_t * p = Ahist + i;
+			size_t j;
+			for ( j = 0; j < numthreads; ++j )
+			{
+				*p += a;
+				p += PARALLEL_INTERLEAVED_RADIX_SORT_NUM_BUCKETS;
+			}
+		}
+
+		if ( (r + 1 < rounds) && interleave )
+		{
+			unsigned int const key_offset_0 = keybytes[r];
+			unsigned int const key_offset_1 = keybytes[r+1];
+			size_t t;
+
+			for ( t = 0; t < numthreads; ++t )
+			{
+				PARALLEL_INTERLEAVED_RADIX_SORT_SORT_PACKAGE * package =
+					(PARALLEL_INTERLEAVED_RADIX_SORT_SORT_PACKAGE *)packagespace + t;
+
+				package->header.dispatcher = PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_SORT_PACKAGE;
+				package->header.sync = sortcontrol->sync;
+				package->t = t;
+				package->numthreads = numthreads;
+				package->packsize = packsize;
+				package->n = n;
+				package->ita = ita;
+				package->tita = tita;
+				package->Ahist = Ahist;
+				package->Athist = Athist;
+				package->key_offset_0 = key_offset_0;
+				package->key_offset_1 = key_offset_1;
+
+				PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ENQUEUE(sortcontrol,package);
+			}
+			PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_WAITSYNC(sortcontrol);
+
+			for ( t = 0; t < numthreads; ++t )
+			{
+				PARALLEL_INTERLEAVED_RADIX_SORT_HISTACC_PACKAGE * package =
+					(PARALLEL_INTERLEAVED_RADIX_SORT_HISTACC_PACKAGE *)packagespace + t;
+
+				package->header.dispatcher = PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_HISTACC_PACKAGE;
+				package->header.sync = sortcontrol->sync;
+				package->t = t;
+				package->numthreads = numthreads;
+				package->Ahist = Ahist;
+				package->Athist = Athist;
+
+				PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ENQUEUE(sortcontrol,package);
+			}
+			PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_WAITSYNC(sortcontrol);
+		}
+		else
+		{
+			unsigned int const key_offset_0 = keybytes[r];
+			size_t t;
+
+			for ( t = 0; t < numthreads; ++t )
+			{
+				PARALLEL_INTERLEAVED_RADIX_SORT_FINALSORT_PACKAGE * package =
+					(PARALLEL_INTERLEAVED_RADIX_SORT_FINALSORT_PACKAGE *)packagespace + t;
+
+				package->header.dispatcher = PARALLEL_INTERLEAVED_RADIX_SORT_DISPATCH_FINALSORT_PACKAGE;
+				package->header.sync = sortcontrol->sync;
+				package->t = t;
+				package->packsize = packsize;
+				package->n = n;
+				package->ita = ita;
+				package->tita = tita;
+				package->Ahist = Ahist;
+				package->key_offset_0 = key_offset_0;
+
+				PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_ENQUEUE(sortcontrol,package);
+			}
+			PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_WAITSYNC(sortcontrol);
+		}
+
+		PARALLEL_INTERLEAVED_RADIX_SORT_SWAP(ita,tita,it_swap_tmp);
+	}
+
+	PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_TERM(sortcontrol);
+
+	cleanup:
+	if ( Ahist )
+		free(Ahist);
+	if ( Athist )
+		free(Athist);
+	if ( packagespace )
+		free(packagespace);
+	if ( sortcontrol )
+		PARALLEL_INTERLEAVED_RADIX_SORT_SORTCONTROL_DESTROY(sortcontrol);
+	return returncode;
+}
+
+int PARALLEL_INTERLEAVED_RADIX_SORT_DENSEKEY_FUNCTIONNAME(
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE ** rita,
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * ita,
+	PARALLEL_INTERLEAVED_RADIX_SORT_VALUE_TYPE * tita,
+	size_t const n,
+	unsigned int const tnumthreads,
+	unsigned int const keylength,
+	int const * keybytes,
+	int const interleave
+)
+{
+	unsigned int numkey = 0;
+	size_t i;
+	size_t j;
+	unsigned int * sparsekeybytes = 0;
+	int returncode = 0;
+
+	for ( i = 0; i < keylength; ++i )
+		if ( keybytes[i] )
+			++numkey;
+
+	sparsekeybytes = (unsigned int *)malloc(numkey * sizeof(unsigned int));
+
+	if ( ! sparsekeybytes )
+	{
+		returncode = -1;
+		goto cleanup;
+	}
+
+	j = 0;
+	for ( i = 0; i < keylength; ++i )
+		if ( keybytes[i] )
+			sparsekeybytes[j++] = i;
+
+	returncode = PARALLEL_INTERLEAVED_RADIX_SORT_FUNCTIONNAME(
+		ita,tita,n,tnumthreads,numkey,sparsekeybytes,interleave
+	);
+
+	*rita = (numkey&1) ? tita : ita;
+
+	cleanup:
+	if ( sparsekeybytes )
+		free(sparsekeybytes);
+
+	return returncode;
+}
