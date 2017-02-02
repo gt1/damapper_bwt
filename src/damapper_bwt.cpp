@@ -3816,6 +3816,8 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 {
 	std::ostringstream ostr;
 
+	ostr << "This is " << PACKAGE_NAME << " version " << PACKAGE_VERSION << std::endl;
+	ostr << std::endl;
 	ostr << "usage: " << arg.progname << " [<parameters>] ref.fasta <reads.fasta" << std::endl;
 	ostr << "\n";
 	ostr << "parameters:\n";
