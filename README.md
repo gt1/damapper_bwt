@@ -25,6 +25,11 @@ Binary releases
 
 Binary releases for Linux x86_64 can be found at https://github.com/gt1/damapper_bwt/releases/ .
 
+Licensing
+---------
+
+damapper_bwt is distributed under version 3 of the GPL.
+
 Compilation of damapper_bwt
 ---------------------------
 
