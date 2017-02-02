@@ -73,6 +73,7 @@ The following parameters can be used (no space allowed between option an argumen
 * -I: input format (fasta (default) or bam)
 * -Z: do not encode secondary alignments (default: report secondary hits)
 * -P: selection strategy for primary alignment (randombest (default) or firstbest)
+* -e: damapper correlation threshold (default 0.85)
 
 BAM output files
 ----------------

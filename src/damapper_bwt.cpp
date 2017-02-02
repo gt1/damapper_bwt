@@ -232,131 +232,6 @@ struct OverlapComparatorBReadRefLength
 	}
 };
 
-#if 0
-void writeDatabaseAsFasta(HITS_DB const & db, std::ostream & out, std::vector<std::string> const * readnames = 0)
-{
-	uint64_t const towrite =
-		std::min(
-			static_cast<uint64_t>(db.nreads),
-			static_cast<uint64_t>(readnames ? readnames->size() : db.nreads)
-		);
-	for ( uint64_t i = 0; i < towrite; ++i )
-	{
-		std::ostringstream namestr;
-
-		if ( readnames )
-			namestr << ((*readnames)[i]);
-		else
-			namestr << "L0/" << i << "/" << 0 << "_" << db.reads[i].rlen << " RQ=0.851";
-
-		out << ">" << namestr.str() << '\n';
-		char const * p = reinterpret_cast<char const *>(db.bases) + db.reads[i].boff;
-		uint64_t n = db.reads[i].rlen;
-		uint64_t const colwidth = 80;
-
-		while ( n )
-		{
-			uint64_t const towrite = std::min(colwidth,n);
-			for ( uint64_t i = 0; i < towrite; ++i )
-				out.put(libmaus2::fastx::remapChar(p[i]));
-			out.put('\n');
-			p += towrite;
-			n -= towrite;
-		}
-	}
-}
-
-void writeDatabaseAsFasta(HITS_DB const & db, std::string const & fn, std::vector<std::string> const & readnames)
-{
-	libmaus2::aio::OutputStreamInstance::unique_ptr_type OSI(new libmaus2::aio::OutputStreamInstance(fn+".fasta"));
-	writeDatabaseAsFasta(db,*OSI,NULL);
-	OSI->flush();
-	OSI.reset();
-
-	std::ostringstream delstr;
-	delstr << "/home/tischler/src/git/DAZZ_DB/DBrm " << fn << ".db";
-	std::string const del = delstr.str();
-	system(del.c_str());
-
-	std::ostringstream comstr;
-	comstr << "/home/tischler/src/git/DAZZ_DB/fasta2DB " << fn << ".db " << fn << ".fasta";
-	std::string const com = comstr.str();
-	system(com.c_str());
-
-	std::ostringstream splitcomstr;
-	splitcomstr << "/home/tischler/src/git/DAZZ_DB/DBsplit -s500 -x0 " << fn << ".db";
-	std::string const splitcom = splitcomstr.str();
-	system(splitcom.c_str());
-
-	libmaus2::aio::OutputStreamInstance::unique_ptr_type OSIrn(new libmaus2::aio::OutputStreamInstance(fn+".fasta"));
-	writeDatabaseAsFasta(db,*OSIrn,&readnames);
-	OSIrn->flush();
-	OSIrn.reset();
-
-	std::ostringstream faidxcomstr;
-	faidxcomstr << "samtools faidx " << fn << ".fasta";
-	std::string const faidxcom = faidxcomstr.str();
-	system(faidxcom.c_str());
-}
-#endif
-
-struct DalignerInfo
-{
-	typedef DalignerInfo this_type;
-	typedef libmaus2::util::unique_ptr<this_type>::type unique_ptr_type;
-	typedef libmaus2::util::shared_ptr<this_type>::type shared_ptr_type;
-
-	Work_Data * wd;
-	Align_Spec * aspec;
-	::Alignment align;
-	::Path path;
-
-	void cleanup()
-	{
-		if ( wd )
-		{
-			Free_Work_Data(wd);
-			wd = 0;
-		}
-		if ( aspec )
-		{
-			Free_Align_Spec(aspec);
-			aspec = 0;
-		}
-	}
-
-	DalignerInfo(double const rcor = 0.85, int64_t const rtspace = 100)
-	: wd(0), aspec(0)
-	{
-		float freq[4] = { 0.25, 0.25, 0.25, 0.25 };
-		wd = ::New_Work_Data();
-		if ( ! wd )
-		{
-			cleanup();
-			libmaus2::exception::LibMausException lme;
-			lme.getStream() << "DalignerInfo: failed call New_Work_Data" << std::endl;
-			lme.finish();
-			throw lme;
-		}
-
-		aspec = New_Align_Spec(rcor,rtspace,&freq[0]);
-
-		if ( ! aspec )
-		{
-			cleanup();
-			libmaus2::exception::LibMausException lme;
-			lme.getStream() << "DalignerInfo: failed call New_Align_Spec" << std::endl;
-			lme.finish();
-			throw lme;
-		}
-	}
-
-	~DalignerInfo()
-	{
-		cleanup();
-	}
-};
-
 struct DNAIndexBase
 {
 	static uint64_t readSamplingRate(std::string const & fn)
@@ -2581,7 +2456,10 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	// default k
 	unsigned int const defk = 20;
 	unsigned int const k = arg.argPresent("k") ? arg.getUnsignedNumericArg<uint64_t>("k") : defk;
-
+	double const e = arg.argPresent("e") ? arg.getParsedArg<double>("e") : 0.85;
+	
+	std::cerr << "[V] e " << e << std::endl;
+	
 	bool const encodesecondary = !(arg.argPresent("Z"));
 
 	primary_strategy primstrat;
@@ -2792,7 +2670,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 
 		float freq[4] = { 0.25, 0.25, 0.25, 0.25 };
 		int64_t const tspace = 100;
-		Align_Spec * aspec = New_Align_Spec(0.85, tspace, &freq[0]);
+		Align_Spec * aspec = New_Align_Spec(e, tspace, &freq[0]);
 		Set_Filter_Params(k, 0, numthreads);
 
 		libmaus2::fastx::LineBufferFastAReader::unique_ptr_type LBFA;
@@ -3840,6 +3718,7 @@ std::string getUsage(libmaus2::util::ArgParser const & arg)
 	ostr << " -I: input format (fasta (default) or bam)\n";
 	ostr << " -Z: do not encode secondary alignments (default: encode secondary)\n";
 	ostr << " -P: selection strategy for primary alignment (randombest (default) or firstbest)\n";
+	ostr << " -e: damapper correlation threshold (default 0.85)\n";
 	ostr << "\n";
 
 	return ostr.str();
