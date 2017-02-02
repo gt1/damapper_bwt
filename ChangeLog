@@ -1,3 +1,9 @@
+damapper-bwt (0.0.15-1) unstable; urgency=medium
+
+  * add -e parameter for setting damapper correlation threshold
+
+ -- German Tischler <tischler@mpi-cbg.de>  Thu, 02 Feb 2017 15:38:24 +0100
+
 damapper-bwt (0.0.14-1) unstable; urgency=medium
 
   * add argument recording in verbose mode
