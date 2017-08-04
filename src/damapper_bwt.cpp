@@ -1773,6 +1773,32 @@ struct PackageEncodeBam
 	}
 };
 
+static void rewriteName(libmaus2::autoarray::AutoArray < char > & out, char const * in)
+{
+	uint64_t o = 0;
+	while ( *in )
+	{
+		char const c = *(in++);
+
+		if ( isalnum(c) || (ispunct(c) && c!='%') || c == ' ' )
+			out.push(o,c);
+		else
+		{
+			out.push(o,'%');
+
+			std::ostringstream ostr;
+			ostr << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(static_cast<unsigned int>(c));
+
+			std::string const s = ostr.str();
+
+			for ( uint64_t i = 0; i < s.size(); ++i )
+				out.push(o,s[i]);
+		}
+	}
+
+	out.push(o,0);
+}
+
 static void threadEncodeBam(PackageEncodeBam package)
 {
 	uint64_t tid = package.zr-1;
@@ -1798,6 +1824,7 @@ static void threadEncodeBam(PackageEncodeBam package)
 	libmaus2::autoarray::AutoArray < libmaus2::bambam::BamAlignmentDecoderBase::AuxInfo > auxinfo;
 	libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * > Aauxadd;
 	libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest > Aauxcopy;
+	libmaus2::autoarray::AutoArray < char > Anamewr;
 
 	// process in batches of equal b read id
 	uint64_t ilow = rlow;
@@ -1842,6 +1869,10 @@ static void threadEncodeBam(PackageEncodeBam package)
 
 			for ( uint64_t i = 0; i < oauxcopy; ++i )
 				Aauxadd.push(oauxadd,&Aauxcopy[i]);
+
+			rewriteName(Anamewr, rname);
+			libmaus2::dazzler::align::LASToBamConverterBase::AuxTagStringAddRequest fnobj("fn",Anamewr.begin());
+			Aauxadd.push(oauxadd,&fnobj);
 
 			libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &Aauxadd[0];
 			libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &Aauxadd[oauxadd];
@@ -1952,7 +1983,6 @@ static void threadEncodeBam(PackageEncodeBam package)
 
 		std::sort(VCI.begin(),VCI.end());
 
-
 		{
 			// compute reverse complement
 			context.ARC.ensureSize(readlen + 2);
@@ -2022,6 +2052,10 @@ static void threadEncodeBam(PackageEncodeBam package)
 					Aauxadd.push(oauxadd,&req_l);
 					for ( uint64_t i = 0; i < oauxcopy; ++i )
 						Aauxadd.push(oauxadd,&Aauxcopy[i]);
+
+					rewriteName(Anamewr, readname);
+					libmaus2::dazzler::align::LASToBamConverterBase::AuxTagStringAddRequest fnobj("fn",Anamewr.begin());
+					Aauxadd.push(oauxadd,&fnobj);
 
 					// MD,NM,AS,ci,cn,cj,cl
 
@@ -2140,7 +2174,9 @@ static void threadEncodeUnmapped(PackageEncodeUnmapped package)
 	auxfilter.set('c','j');
 	auxfilter.set('c','l');
 	libmaus2::autoarray::AutoArray < libmaus2::bambam::BamAlignmentDecoderBase::AuxInfo > auxinfo;
-	libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * > Aauxadd;					libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest > Aauxcopy;
+	libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const * > Aauxadd;
+	libmaus2::autoarray::AutoArray < libmaus2::dazzler::align::LASToBamConverterBase::AuxTagCopyAddRequest > Aauxcopy;
+	libmaus2::autoarray::AutoArray < char > Anamewr;
 
 	for ( uint64_t i = plow; i < phigh; ++i )
 	{
@@ -2174,6 +2210,10 @@ static void threadEncodeUnmapped(PackageEncodeUnmapped package)
 
 		for ( uint64_t j = 0; j < oauxcopy; ++j )
 			Aauxadd.push(oauxadd,&Aauxcopy[j]);
+
+		rewriteName(Anamewr, rname);
+		libmaus2::dazzler::align::LASToBamConverterBase::AuxTagStringAddRequest fnobj("fn",Anamewr.begin());
+		Aauxadd.push(oauxadd,&fnobj);
 
 		libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_a = &Aauxadd[0];
 		libmaus2::dazzler::align::LASToBamConverterBase::AuxTagAddRequest const ** aux_e = &Aauxadd[oauxadd];
@@ -2457,9 +2497,9 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 	unsigned int const defk = 20;
 	unsigned int const k = arg.argPresent("k") ? arg.getUnsignedNumericArg<uint64_t>("k") : defk;
 	double const e = arg.argPresent("e") ? arg.getParsedArg<double>("e") : 0.85;
-	
+
 	std::cerr << "[V] e " << e << std::endl;
-	
+
 	bool const encodesecondary = !(arg.argPresent("Z"));
 
 	primary_strategy primstrat;
@@ -2875,6 +2915,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 					assert ( Areaddata [ readoffset + rlen ] == padsym );
 
 					O.push(oo,libmaus2::fastx::LineBufferFastAReader::ReadMeta(prev_o_name,readoffset,rlen));
+
 					prev_o_name = o_name;
 				}
 			}
