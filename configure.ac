@@ -41,6 +41,14 @@ CXXFLAGS=""
 AC_PROG_CXX
 CXXFLAGS="${CXXFLAGS_SAVE}"
 
+AC_ARG_ENABLE(asan,
+        AS_HELP_STRING([--enable-asan],[enable address sanitizer in debug mode (default no)]),
+        [enableasan=${enableval}],[enableasan=no])
+
+AC_ARG_ENABLE(stackprotector,
+        AS_HELP_STRING([--enable-asan],[enable address sanitizer in debug mode (default no)]),
+        [stackprotector=${enableval}],[stackprotector=no])
+
 if test "${debug}" = "yes" ; then
 	CXXDEBUGFLAGS="-g -O0 -rdynamic"
 	CDEBUGFLAGS="-g -O0 -rdynamic"
@@ -60,7 +68,7 @@ if test "${debug}" = "yes" ; then
 	CXXFLAGS="${CXXFLAGS_SAVE}"
 	AC_LANG_POP
 
-	if test "${sanitizeaddress}" = "yes" ; then
+	if test \( "${sanitizeaddress}" = "yes" \) -a \( "${enableasan}" = "yes" \) ; then
 		CXXFLAGS="${CXXFLAGS} -fsanitize=address"
 		CFLAGS="${CFLAGS} -fsanitize=address"
 	fi
@@ -74,7 +82,7 @@ if test "${debug}" = "yes" ; then
 	CXXFLAGS="${CXXFLAGS_SAVE}"
 	AC_LANG_POP
 
-	if test "${stackprotect}" = "yes" ; then
+	if test \( "${stackprotect}" = "yes" \) -a \( "${stackprotector}" = "yes" \) ; then
 		STACKPROTECT="-fstack-protector"
 		CXXFLAGS="${CXXFLAGS} ${STACKPROTECT}"
 		CFLAGS="${CFLAGS} ${STACKPROTECT}"
