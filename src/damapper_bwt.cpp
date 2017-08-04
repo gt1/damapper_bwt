@@ -3004,6 +3004,7 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 			};
 
 			uint64_t indexyield = 0;
+			bool dainit = false;
 
 			for ( uint64_t index_i = 0; index_i < indexes.size(); ++index_i )
 			{
@@ -3388,8 +3389,9 @@ int damapper_bwt(libmaus2::util::ArgParser const & arg)
 				{
 					lclock.start();
 					QueryKMer * Qindex = GRQKM.take();
-					Match_Filter(&readsdb, &refdb, GQKM.begin(), NUMQK[numpacks], Qindex, NUMREFKVALID.back(), (index_i==1) /* comp */, (index_i==0) /* start */);
+					Match_Filter(&readsdb, &refdb, GQKM.begin(), NUMQK[numpacks], Qindex, NUMREFKVALID.back(), (index_i==1) /* comp */, (!dainit) /* start */);
 					indexyield += 1;
+					dainit = true;
 					if ( verbose > 1 )
 						std::cerr << "[V] ran Match_Filter in time " << lclock.formatTime(lclock.getElapsedSeconds()) << std::endl;
 				}
